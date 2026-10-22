@@ -1,17 +1,17 @@
-# Godot 4
-.godot/
-*.translation
-export.cfg
-export_presets.cfg
-.import/
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
 
-# Builds
+# Bevy / native
+*.pdb
+
+# Builds / dist
 build/
 dist/
 *.app
 *.dmg
 *.zip
-*.pck
 
 # OS / IDE
 .DS_Store
@@ -24,7 +24,7 @@ dist/
 .env
 .env.*
 
-# Python / misc tooling (если появятся скрипты)
+# Python tooling (если появятся скрипты)
 __pycache__/
 .venv/
 venv/
