@@ -1,0 +1,30 @@
+# Godot 4
+.godot/
+*.translation
+export.cfg
+export_presets.cfg
+.import/
+
+# Builds
+build/
+dist/
+*.app
+*.dmg
+*.zip
+*.pck
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Env / secrets
+.env
+.env.*
+
+# Python / misc tooling (если появятся скрипты)
+__pycache__/
+.venv/
+venv/
