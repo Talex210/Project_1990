@@ -36,7 +36,7 @@ impl Tile {
     /// Parse a single map character.
     pub fn from_char(c: char) -> Option<Self> {
         Some(match c {
-            '.' | ' ' | 'P' => Tile::Empty,
+            '.' | ' ' | 'P' | 'X' => Tile::Empty,
             '#' | 'B' => Tile::Brick,
             'S' => Tile::Steel,
             '~' | 'W' => Tile::Water,

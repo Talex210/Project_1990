@@ -1,9 +1,9 @@
-//! Bevy presentation layer for Project 1990 (phase 1).
+//! Bevy presentation layer for Project 1990.
 //!
 //! Simulation lives in `project1990-sim`; this binary only renders and feeds input.
 
 use bevy::prelude::*;
-use project1990_sim::{Dir, Map, SimInput, Tile, World, DEFAULT_TICK_HZ};
+use project1990_sim::{Dir, Map, SimInput, Team, Tile, World, DEFAULT_TICK_HZ};
 
 const TILE_PX: f32 = 32.0;
 const MAP_TEXT: &str = include_str!("../../../data/maps/test_level.txt");
@@ -43,7 +43,9 @@ struct TileSprite {
 }
 
 #[derive(Component)]
-struct TankSprite;
+struct TankSprite {
+    sim_id: u64,
+}
 
 #[derive(Component)]
 struct BulletSprite {
@@ -51,7 +53,11 @@ struct BulletSprite {
 }
 
 #[derive(Component)]
-struct AutofireLabel;
+struct HudLabel;
+
+/// When true, show the controls cheat-sheet under the status line.
+#[derive(Resource)]
+struct ShowControlsHelp(bool);
 
 fn setup(mut commands: Commands) {
     let map = Map::parse(MAP_TEXT).expect("test_level.txt must parse");
@@ -62,8 +68,8 @@ fn setup(mut commands: Commands) {
     commands.spawn(Camera2d);
     commands.insert_resource(ViewMeta { map_w, map_h });
     commands.insert_resource(FrameInput::default());
+    commands.insert_resource(ShowControlsHelp(true));
 
-    // Tiles
     for y in 0..world.map.height() {
         for x in 0..world.map.width() {
             let tile = world.map.get(x, y).unwrap();
@@ -76,34 +82,50 @@ fn setup(mut commands: Commands) {
         }
     }
 
-    // Player tank
-    if let Some(tank) = world.player() {
-        let (bx, by) = sim_to_bevy(tank.x, tank.y, map_w, map_h);
-        commands.spawn((
-            TankSprite,
-            Sprite::from_color(Color::srgb(0.2, 0.85, 0.35), Vec2::splat(TILE_PX * 0.8)),
-            Transform::from_xyz(bx, by, 1.0),
-        ));
+    for tank in &world.tanks {
+        spawn_tank_sprite(&mut commands, tank.id, tank.team, tank.x, tank.y, map_w, map_h);
     }
 
     commands.spawn((
-        AutofireLabel,
-        Text2d::new("autofire: off  |  WASD move  Space fire  K toggle autofire"),
+        HudLabel,
+        Text2d::new(hud_text(&world, true)),
         TextFont {
-            font_size: FontSize::Px(18.0),
+            font_size: FontSize::Px(16.0),
             ..default()
         },
         TextColor(Color::srgb(0.9, 0.9, 0.85)),
-        Transform::from_xyz(0.0, map_h * TILE_PX * 0.5 + 24.0, 2.0),
+        Transform::from_xyz(0.0, map_h * TILE_PX * 0.5 + 36.0, 2.0),
     ));
 
     commands.insert_resource(SimWorld(world));
 }
 
+fn spawn_tank_sprite(
+    commands: &mut Commands,
+    sim_id: u64,
+    team: Team,
+    x: f32,
+    y: f32,
+    map_w: f32,
+    map_h: f32,
+) {
+    let (bx, by) = sim_to_bevy(x, y, map_w, map_h);
+    commands.spawn((
+        TankSprite { sim_id },
+        Sprite::from_color(team_color(team), Vec2::splat(TILE_PX * 0.8)),
+        Transform::from_xyz(bx, by, 1.0),
+    ));
+}
+
 fn read_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut frame: ResMut<FrameInput>,
+    mut help: ResMut<ShowControlsHelp>,
 ) {
+    if keys.just_pressed(KeyCode::KeyH) {
+        help.0 = !help.0;
+    }
+
     let move_dir = if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) {
         Some(Dir::Up)
     } else if keys.pressed(KeyCode::KeyS) || keys.pressed(KeyCode::ArrowDown) {
@@ -132,10 +154,17 @@ fn step_sim(mut sim: ResMut<SimWorld>, frame: Res<FrameInput>) {
 fn sync_view(
     sim: Res<SimWorld>,
     meta: Res<ViewMeta>,
-    mut tiles: Query<(&TileSprite, &mut Sprite)>,
-    mut tank_q: Query<&mut Transform, (With<TankSprite>, Without<BulletSprite>)>,
-    mut bullets: Query<(Entity, &BulletSprite, &mut Transform)>,
-    mut label: Query<&mut Text2d, With<AutofireLabel>>,
+    mut tiles: Query<(&TileSprite, &mut Sprite), (With<TileSprite>, Without<TankSprite>)>,
+    mut tanks: Query<
+        (Entity, &TankSprite, &mut Transform, &mut Sprite),
+        (With<TankSprite>, Without<TileSprite>, Without<BulletSprite>),
+    >,
+    mut bullets: Query<
+        (Entity, &BulletSprite, &mut Transform),
+        (With<BulletSprite>, Without<TankSprite>, Without<TileSprite>),
+    >,
+    mut label: Query<&mut Text2d, With<HudLabel>>,
+    help: Res<ShowControlsHelp>,
     mut commands: Commands,
 ) {
     for (marker, mut sprite) in &mut tiles {
@@ -144,22 +173,47 @@ fn sync_view(
         }
     }
 
-    if let Some(tank) = sim.0.player() {
-        if let Ok(mut tf) = tank_q.single_mut() {
-            let (bx, by) = sim_to_bevy(tank.x, tank.y, meta.map_w, meta.map_h);
+    if let Ok(mut text) = label.single_mut() {
+        text.0 = hud_text(&sim.0, help.0);
+    }
+
+    let live_tanks: Vec<(u64, Team, f32, f32, Dir)> = sim
+        .0
+        .tanks
+        .iter()
+        .map(|t| (t.id, t.team, t.x, t.y, t.dir))
+        .collect();
+
+    let mut seen_tanks = Vec::new();
+    for (entity, marker, mut tf, mut sprite) in &mut tanks {
+        if let Some((_, team, x, y, dir)) =
+            live_tanks.iter().find(|(id, _, _, _, _)| *id == marker.sim_id)
+        {
+            let (bx, by) = sim_to_bevy(*x, *y, meta.map_w, meta.map_h);
             tf.translation.x = bx;
             tf.translation.y = by;
-            tf.rotation = Quat::from_rotation_z(dir_angle(tank.dir));
+            tf.rotation = Quat::from_rotation_z(dir_angle(*dir));
+            sprite.color = team_color(*team);
+            seen_tanks.push(marker.sim_id);
+        } else {
+            commands.entity(entity).despawn();
         }
-        if let Ok(mut text) = label.single_mut() {
-            let state = if tank.fire.autofire { "ON" } else { "off" };
-            text.0 = format!(
-                "autofire: {state}  |  WASD move  Space/J fire  K toggle autofire"
+    }
+    for (id, team, x, y, _) in &live_tanks {
+        if !seen_tanks.contains(id) {
+            spawn_tank_sprite(
+                &mut commands,
+                *id,
+                *team,
+                *x,
+                *y,
+                meta.map_w,
+                meta.map_h,
             );
         }
     }
 
-    let live: Vec<(u64, f32, f32)> = sim
+    let live_bullets: Vec<(u64, f32, f32)> = sim
         .0
         .bullets
         .iter()
@@ -169,25 +223,45 @@ fn sync_view(
         })
         .collect();
 
-    let mut seen = Vec::new();
+    let mut seen_bullets = Vec::new();
     for (entity, marker, mut tf) in &mut bullets {
-        if let Some((_, bx, by)) = live.iter().find(|(id, _, _)| *id == marker.sim_id) {
+        if let Some((_, bx, by)) = live_bullets.iter().find(|(id, _, _)| *id == marker.sim_id) {
             tf.translation.x = *bx;
             tf.translation.y = *by;
-            seen.push(marker.sim_id);
+            seen_bullets.push(marker.sim_id);
         } else {
             commands.entity(entity).despawn();
         }
     }
-
-    for (id, bx, by) in live {
-        if !seen.contains(&id) {
+    for (id, bx, by) in live_bullets {
+        if !seen_bullets.contains(&id) {
             commands.spawn((
                 BulletSprite { sim_id: id },
                 Sprite::from_color(Color::srgb(1.0, 0.95, 0.4), Vec2::splat(8.0)),
                 Transform::from_xyz(bx, by, 1.5),
             ));
         }
+    }
+}
+
+fn hud_text(world: &World, show_help: bool) -> String {
+    let on = world.enemies_on_field();
+    let max = world.wave.config.max_on_field;
+    let left = world.wave.remaining_in_wave(on);
+    let auto = world
+        .player()
+        .map(|p| if p.fire.autofire { "ON" } else { "off" })
+        .unwrap_or("off");
+    let status = format!(
+        "enemies {on}/{max}  |  left {left}  |  destroyed {}  |  autofire {auto}",
+        world.wave.destroyed
+    );
+    if show_help {
+        format!(
+            "{status}\nWASD/arrows move   Space/J fire   K autofire   H hide controls"
+        )
+    } else {
+        format!("{status}   |   H show controls")
     }
 }
 
@@ -203,6 +277,13 @@ fn dir_angle(dir: Dir) -> f32 {
         Dir::Right => -std::f32::consts::FRAC_PI_2,
         Dir::Down => std::f32::consts::PI,
         Dir::Left => std::f32::consts::FRAC_PI_2,
+    }
+}
+
+fn team_color(team: Team) -> Color {
+    match team {
+        Team::Player => Color::srgb(0.2, 0.85, 0.35),
+        Team::Enemy => Color::srgb(0.9, 0.25, 0.2),
     }
 }
 

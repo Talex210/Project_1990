@@ -17,6 +17,7 @@ pub struct Map {
     height: u32,
     tiles: Vec<Tile>,
     player_spawns: Vec<SpawnPoint>,
+    enemy_spawns: Vec<SpawnPoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +58,7 @@ impl Map {
             height,
             tiles: vec![fill; len],
             player_spawns: Vec::new(),
+            enemy_spawns: Vec::new(),
         }
     }
 
@@ -64,11 +66,12 @@ impl Map {
     ///
     /// Lines are rows top→bottom. Characters:
     /// `.` / ` ` empty, `#` brick, `S` steel, `~`/`W` water, `F`/`T` forest,
-    /// `I` ice, `E` base, `P` player spawn (empty cell + spawn marker).
+    /// `I` ice, `E` base, `P` player spawn, `X` enemy spawn (empty + marker).
     /// Blank lines and lines starting with `//` are ignored.
     pub fn parse(text: &str) -> Result<Self, MapError> {
         let mut rows: Vec<Vec<Tile>> = Vec::new();
         let mut spawns: Vec<SpawnPoint> = Vec::new();
+        let mut enemy_spawns: Vec<SpawnPoint> = Vec::new();
 
         for (line_idx, raw) in text.lines().enumerate() {
             let line = raw.trim_end_matches('\r');
@@ -84,6 +87,12 @@ impl Map {
                 })?;
                 if ch == 'P' {
                     spawns.push(SpawnPoint {
+                        x: col as u32,
+                        y: rows.len() as u32,
+                    });
+                }
+                if ch == 'X' {
+                    enemy_spawns.push(SpawnPoint {
                         x: col as u32,
                         y: rows.len() as u32,
                     });
@@ -118,6 +127,7 @@ impl Map {
             height,
             tiles,
             player_spawns: spawns,
+            enemy_spawns,
         })
     }
 
@@ -131,6 +141,10 @@ impl Map {
 
     pub fn player_spawns(&self) -> &[SpawnPoint] {
         &self.player_spawns
+    }
+
+    pub fn enemy_spawns(&self) -> &[SpawnPoint] {
+        &self.enemy_spawns
     }
 
     pub fn in_bounds(&self, x: i32, y: i32) -> bool {

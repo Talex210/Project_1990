@@ -3,6 +3,7 @@
 use crate::fire::{FireConfig, FireController};
 use crate::map::Map;
 use crate::tile::Tile;
+use crate::wave::{WaveConfig, WaveState};
 
 /// Default simulation rate (Hz). Presentation interpolates; network later locks to this.
 pub const DEFAULT_TICK_HZ: u32 = 60;
@@ -49,6 +50,7 @@ pub struct Tank {
 pub struct Bullet {
     pub id: u64,
     pub owner_id: u64,
+    pub team: Team,
     pub x: f32,
     pub y: f32,
     pub dir: Dir,
@@ -61,16 +63,18 @@ pub struct SimConfig {
     pub tank_half: f32,
     pub bullet_half: f32,
     pub fire: FireConfig,
+    pub wave: WaveConfig,
 }
 
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
-            tank_speed: 4.0,   // tiles per second
+            tank_speed: 4.0, // tiles per second
             bullet_speed: 12.0,
             tank_half: 0.4,
             bullet_half: 0.12,
             fire: FireConfig::default(),
+            wave: WaveConfig::default(),
         }
     }
 }
@@ -90,21 +94,27 @@ pub struct World {
     pub tanks: Vec<Tank>,
     pub bullets: Vec<Bullet>,
     pub config: SimConfig,
+    pub wave: WaveState,
     pub tick: u64,
     next_id: u64,
     player_tank_id: u64,
+    /// Round-robin index into enemy spawn points.
+    next_enemy_spawn: usize,
 }
 
 impl World {
     pub fn new(map: Map, config: SimConfig) -> Self {
+        let wave = WaveState::new(config.wave);
         let mut world = Self {
             map,
             tanks: Vec::new(),
             bullets: Vec::new(),
             config,
+            wave,
             tick: 0,
             next_id: 1,
             player_tank_id: 0,
+            next_enemy_spawn: 0,
         };
 
         let spawn = world
@@ -126,6 +136,13 @@ impl World {
             move_dir: None,
         });
         world
+    }
+
+    pub fn enemies_on_field(&self) -> u32 {
+        self.tanks
+            .iter()
+            .filter(|t| t.team == Team::Enemy)
+            .count() as u32
     }
 
     pub fn player_tank_id(&self) -> u64 {
@@ -163,37 +180,147 @@ impl World {
         self.move_tanks(dt);
         self.fire_weapons(dt);
         self.move_bullets(dt);
+        self.resolve_bullet_tank_hits();
+        // Spawn after combat so a dying tank frees a slot the same tick,
+        // and leftover bullets don't instantly delete the newborn.
+        self.spawn_enemies(dt);
         self.tick += 1;
+    }
+
+    fn spawn_enemies(&mut self, dt: f32) {
+        self.wave.tick_cooldown(dt);
+        let on_field = self.enemies_on_field();
+        if !self.wave.can_spawn(on_field) {
+            return;
+        }
+        let spawns = self.map.enemy_spawns();
+        if spawns.is_empty() {
+            return;
+        }
+
+        let half = self.config.tank_half;
+        let n = spawns.len();
+        for attempt in 0..n {
+            let idx = (self.next_enemy_spawn + attempt) % n;
+            let sp = spawns[idx];
+            let cx = sp.x as f32 + 0.5;
+            let cy = sp.y as f32 + 0.5;
+            if !Self::tank_fits(&self.map, cx, cy, half) {
+                continue;
+            }
+            if self.tank_occupies(cx, cy, half, None) {
+                continue;
+            }
+
+            let id = self.alloc_id();
+            self.tanks.push(Tank {
+                id,
+                team: Team::Enemy,
+                x: cx,
+                y: cy,
+                dir: Dir::Down,
+                fire: FireController::new(self.config.fire),
+                // Phase 2.1: stationary — visible spawn/limit; AI is phase 4.
+                move_dir: None,
+            });
+            self.wave.on_spawned();
+            self.next_enemy_spawn = (idx + 1) % n;
+            return;
+        }
+    }
+
+    /// True if any tank's AABB overlaps the given box (optionally ignoring one id).
+    fn tank_occupies(&self, cx: f32, cy: f32, half: f32, ignore_id: Option<u64>) -> bool {
+        for t in &self.tanks {
+            if ignore_id == Some(t.id) {
+                continue;
+            }
+            let dx = (t.x - cx).abs();
+            let dy = (t.y - cy).abs();
+            if dx < half * 2.0 && dy < half * 2.0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn resolve_bullet_tank_hits(&mut self) {
+        let half_b = self.config.bullet_half;
+        let half_t = self.config.tank_half;
+        let mut dead_bullets = Vec::new();
+        let mut dead_tanks = Vec::new();
+
+        for (bi, bullet) in self.bullets.iter().enumerate() {
+            for tank in &self.tanks {
+                if tank.id == bullet.owner_id || tank.team == bullet.team {
+                    continue;
+                }
+                let dx = (tank.x - bullet.x).abs();
+                let dy = (tank.y - bullet.y).abs();
+                if dx < half_t + half_b && dy < half_t + half_b {
+                    dead_bullets.push(bi);
+                    dead_tanks.push(tank.id);
+                    break;
+                }
+            }
+        }
+
+        dead_bullets.sort_unstable();
+        dead_bullets.dedup();
+        for bi in dead_bullets.into_iter().rev() {
+            self.bullets.swap_remove(bi);
+        }
+
+        dead_tanks.sort_unstable();
+        dead_tanks.dedup();
+        for tid in dead_tanks {
+            if let Some(pos) = self.tanks.iter().position(|t| t.id == tid) {
+                let team = self.tanks[pos].team;
+                self.tanks.swap_remove(pos);
+                if team == Team::Enemy {
+                    self.wave.on_destroyed();
+                }
+                self.bullets.retain(|b| b.owner_id != tid);
+            }
+        }
     }
 
     fn move_tanks(&mut self, dt: f32) {
         let speed = self.config.tank_speed;
         let half = self.config.tank_half;
-        let map = &self.map;
+        let n = self.tanks.len();
 
-        for tank in &mut self.tanks {
-            let Some(dir) = tank.move_dir else {
+        for i in 0..n {
+            let Some(dir) = self.tanks[i].move_dir else {
                 continue;
             };
+            let id = self.tanks[i].id;
             let (dx, dy) = dir.delta();
-            let nx = tank.x + dx * speed * dt;
-            let ny = tank.y + dy * speed * dt;
+            let x = self.tanks[i].x;
+            let y = self.tanks[i].y;
+            let nx = x + dx * speed * dt;
+            let ny = y + dy * speed * dt;
 
-            if Self::tank_fits(map, nx, ny, half) {
-                tank.x = nx;
-                tank.y = ny;
+            if self.can_tank_move(id, nx, ny, half) {
+                self.tanks[i].x = nx;
+                self.tanks[i].y = ny;
             } else {
                 // Axis-aligned slide: try X then Y for less sticky corners.
-                let try_x = tank.x + dx * speed * dt;
-                if dx != 0.0 && Self::tank_fits(map, try_x, tank.y, half) {
-                    tank.x = try_x;
+                let try_x = x + dx * speed * dt;
+                if dx != 0.0 && self.can_tank_move(id, try_x, y, half) {
+                    self.tanks[i].x = try_x;
                 }
-                let try_y = tank.y + dy * speed * dt;
-                if dy != 0.0 && Self::tank_fits(map, tank.x, try_y, half) {
-                    tank.y = try_y;
+                let y = self.tanks[i].y;
+                let try_y = y + dy * speed * dt;
+                if dy != 0.0 && self.can_tank_move(id, self.tanks[i].x, try_y, half) {
+                    self.tanks[i].y = try_y;
                 }
             }
         }
+    }
+
+    fn can_tank_move(&self, id: u64, cx: f32, cy: f32, half: f32) -> bool {
+        Self::tank_fits(&self.map, cx, cy, half) && !self.tank_occupies(cx, cy, half, Some(id))
     }
 
     fn tank_fits(map: &Map, cx: f32, cy: f32, half: f32) -> bool {
@@ -221,13 +348,14 @@ impl World {
             .map(|t| self.live_bullets(t.id))
             .collect();
 
-        let mut shots: Vec<(u64, f32, f32, Dir)> = Vec::new();
+        let mut shots: Vec<(u64, Team, f32, f32, Dir)> = Vec::new();
         for (tank, &live) in self.tanks.iter_mut().zip(live_counts.iter()) {
             tank.fire.tick(dt);
             if tank.fire.try_fire(live) {
                 let (dx, dy) = tank.dir.delta();
                 shots.push((
                     tank.id,
+                    tank.team,
                     tank.x + dx * muzzle,
                     tank.y + dy * muzzle,
                     tank.dir,
@@ -235,11 +363,12 @@ impl World {
             }
         }
 
-        for (owner_id, x, y, dir) in shots {
+        for (owner_id, team, x, y, dir) in shots {
             let id = self.alloc_id();
             self.bullets.push(Bullet {
                 id,
                 owner_id,
+                team,
                 x,
                 y,
                 dir,
@@ -320,6 +449,11 @@ mod tests {
                 fire: FireConfig {
                     fire_interval: 0.1,
                     max_bullets: 2,
+                },
+                wave: WaveConfig {
+                    total_enemies: 0,
+                    max_on_field: 4,
+                    spawn_interval: 0.0,
                 },
             },
         )
@@ -517,6 +651,11 @@ P
                     fire_interval: 0.5,
                     max_bullets: 1,
                 },
+                wave: WaveConfig {
+                    total_enemies: 0,
+                    max_on_field: 4,
+                    spawn_interval: 0.0,
+                },
             },
         );
         {
@@ -544,5 +683,234 @@ P
                 "never above max_bullets"
             );
         }
+    }
+
+    #[test]
+    fn wave_never_exceeds_max_on_field() {
+        let mut world = World::new(
+            Map::parse(
+                "\
+X.X.X.X
+.......
+...P...
+",
+            )
+            .unwrap(),
+            SimConfig {
+                wave: WaveConfig {
+                    total_enemies: 10,
+                    max_on_field: 4,
+                    spawn_interval: 0.0,
+                },
+                ..Default::default()
+            },
+        );
+
+        let mut peak = 0u32;
+        for _ in 0..30 {
+            world.step(&SimInput::default(), 1.0 / 60.0);
+            let n = world.enemies_on_field();
+            peak = peak.max(n);
+            assert!(n <= 4, "on_field={n} exceeded max");
+        }
+        assert_eq!(peak, 4);
+        assert_eq!(world.wave.remaining_to_spawn, 6);
+    }
+
+    #[test]
+    fn killing_enemy_frees_slot_for_next_spawn() {
+        let mut world = World::new(
+            Map::parse(
+                "\
+X......
+.......
+...P...
+",
+            )
+            .unwrap(),
+            SimConfig {
+                bullet_speed: 40.0,
+                fire: FireConfig {
+                    fire_interval: 0.0,
+                    max_bullets: 4,
+                },
+                wave: WaveConfig {
+                    total_enemies: 3,
+                    max_on_field: 1,
+                    spawn_interval: 0.0,
+                },
+                ..Default::default()
+            },
+        );
+
+        // Spawn first enemy.
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        assert_eq!(world.enemies_on_field(), 1);
+        assert_eq!(world.wave.remaining_to_spawn, 2);
+
+        let enemy_id = world
+            .tanks
+            .iter()
+            .find(|t| t.team == Team::Enemy)
+            .unwrap()
+            .id;
+        {
+            let p = world.player_mut().unwrap();
+            p.x = 0.5;
+            p.y = 2.5;
+            p.dir = Dir::Up;
+            p.fire.cooldown = 0.0;
+        }
+
+        let mut killed = false;
+        for _ in 0..40 {
+            world.step(
+                &SimInput {
+                    fire_held: true,
+                    ..Default::default()
+                },
+                1.0 / 60.0,
+            );
+            if world.tanks.iter().all(|t| t.id != enemy_id) {
+                killed = true;
+                break;
+            }
+        }
+        assert!(killed, "first enemy should die");
+        assert_eq!(world.wave.destroyed, 1);
+        // Same tick as the kill: spawn runs after combat and fills the freed slot.
+        assert_eq!(world.enemies_on_field(), 1);
+        assert_eq!(world.wave.remaining_to_spawn, 1);
+
+        // Drop leftover player bullets so they don't wipe the replacement.
+        world.bullets.clear();
+        let before_spawn_queue = world.wave.remaining_to_spawn;
+        for _ in 0..10 {
+            world.step(&SimInput::default(), 1.0 / 60.0);
+            assert!(
+                world.enemies_on_field() <= 1,
+                "max_on_field must stay 1"
+            );
+        }
+        // Queue only shrinks when a spawn happens after a later kill; with 1 alive it stays.
+        assert_eq!(world.wave.remaining_to_spawn, before_spawn_queue);
+        assert_eq!(world.enemies_on_field(), 1);
+    }
+
+    #[test]
+    fn tanks_cannot_overlap() {
+        let mut world = tiny_world(
+            "\
+...
+.X.
+.P.
+",
+        );
+        world.config.wave = WaveConfig {
+            total_enemies: 1,
+            max_on_field: 1,
+            spawn_interval: 0.0,
+        };
+        world.wave = crate::wave::WaveState::new(world.config.wave);
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        assert_eq!(world.enemies_on_field(), 1);
+
+        let enemy_y = world
+            .tanks
+            .iter()
+            .find(|t| t.team == Team::Enemy)
+            .unwrap()
+            .y;
+        {
+            let p = world.player_mut().unwrap();
+            p.x = 1.5;
+            p.y = 2.5;
+        }
+        for _ in 0..120 {
+            world.step(
+                &SimInput {
+                    move_dir: Some(Dir::Up),
+                    ..Default::default()
+                },
+                1.0 / 60.0,
+            );
+        }
+        let player = world.player().unwrap();
+        let gap = (player.y - enemy_y).abs();
+        assert!(
+            gap >= world.config.tank_half * 2.0 - 0.05,
+            "player must not overlap enemy (gap={gap})"
+        );
+    }
+
+    #[test]
+    fn kill_delays_next_spawn() {
+        let mut world = World::new(
+            Map::parse(
+                "\
+X......
+.......
+...P...
+",
+            )
+            .unwrap(),
+            SimConfig {
+                bullet_speed: 40.0,
+                fire: FireConfig {
+                    fire_interval: 0.0,
+                    max_bullets: 4,
+                },
+                wave: WaveConfig {
+                    total_enemies: 2,
+                    max_on_field: 1,
+                    spawn_interval: 1.0,
+                },
+                ..Default::default()
+            },
+        );
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        assert_eq!(world.enemies_on_field(), 1);
+        let enemy_id = world
+            .tanks
+            .iter()
+            .find(|t| t.team == Team::Enemy)
+            .unwrap()
+            .id;
+        {
+            let p = world.player_mut().unwrap();
+            p.x = 0.5;
+            p.y = 2.5;
+            p.dir = Dir::Up;
+            p.fire.cooldown = 0.0;
+        }
+        for _ in 0..40 {
+            world.step(
+                &SimInput {
+                    fire_held: true,
+                    ..Default::default()
+                },
+                1.0 / 60.0,
+            );
+            if world.tanks.iter().all(|t| t.id != enemy_id) {
+                break;
+            }
+        }
+        assert_eq!(world.wave.destroyed, 1);
+        // Immediately after kill: cooldown blocks refill.
+        assert_eq!(world.enemies_on_field(), 0);
+        assert!(world.wave.spawn_cooldown > 0.5);
+
+        world.bullets.clear();
+        // Still empty before interval elapses.
+        for _ in 0..30 {
+            world.step(&SimInput::default(), 1.0 / 60.0);
+        }
+        assert_eq!(world.enemies_on_field(), 0);
+
+        // After ~1s total wait, next enemy appears.
+        for _ in 0..60 {
+            world.step(&SimInput::default(), 1.0 / 60.0);
+        }
+        assert_eq!(world.enemies_on_field(), 1);
     }
 }

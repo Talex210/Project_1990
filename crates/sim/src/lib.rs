@@ -5,11 +5,13 @@
 mod fire;
 mod map;
 mod tile;
+mod wave;
 mod world;
 
 pub use fire::{FireConfig, FireController};
 pub use map::{Map, MapError, SpawnPoint};
 pub use tile::Tile;
+pub use wave::{WaveConfig, WaveState};
 pub use world::{
     Bullet, Dir, SimConfig, SimInput, Tank, Team, World, DEFAULT_TICK_HZ,
 };

@@ -1,7 +1,8 @@
-// Phase 1 test map — tiles: . empty, # brick, S steel, ~ water, F forest, I ice, E base, P player
+// Phase 2.1 — X enemy spawn, P player. Center lane open so you can shoot top spawns.
+// . empty  # brick  S steel  ~ water  F forest  I ice  E base
 ################
-#..............#
-#.##.##SS##.##.#
+#X.....X.....X.#
+#.##.S#..#S.##.#
 #..............#
 #..~~~~..FFFF..#
 #..............#
