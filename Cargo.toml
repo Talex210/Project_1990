@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sim",
+    "crates/game",
+]
+default-members = ["crates/game"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Talex210/Project_1990"
+
+[workspace.dependencies]
+project1990-sim = { path = "crates/sim" }
+bevy = { version = "0.20", default-features = true }

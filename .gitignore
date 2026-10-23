@@ -20,6 +20,9 @@ dist/
 *.swp
 *~
 
+# Cursor (локальные правила и служебные файлы — не в репозиторий)
+.cursor/
+
 # Env / secrets
 .env
 .env.*

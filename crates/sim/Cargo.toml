@@ -1,0 +1,12 @@
+[package]
+name = "project1990-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless Battle City–style simulation for Project 1990"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]

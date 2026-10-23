@@ -1,0 +1,16 @@
+[package]
+name = "project1990"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Project 1990 — Battle City–style game (Bevy client)"
+publish = false
+
+[[bin]]
+name = "project1990"
+path = "src/main.rs"
+
+[dependencies]
+project1990-sim = { workspace = true }
+bevy = { workspace = true }
