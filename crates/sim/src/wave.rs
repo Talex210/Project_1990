@@ -74,6 +74,11 @@ impl WaveState {
     pub fn remaining_in_wave(&self, on_field: u32) -> u32 {
         self.remaining_to_spawn + on_field
     }
+
+    /// Wave fully cleared: nothing left to spawn and nobody on the field.
+    pub fn is_cleared(&self, on_field: u32) -> bool {
+        self.config.total_enemies > 0 && self.remaining_to_spawn == 0 && on_field == 0
+    }
 }
 
 #[cfg(test)]

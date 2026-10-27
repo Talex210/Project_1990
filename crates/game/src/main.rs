@@ -3,7 +3,9 @@
 //! Simulation lives in `project1990-sim`; this binary only renders and feeds input.
 
 use bevy::prelude::*;
-use project1990_sim::{Dir, Map, SimInput, Team, Tile, World, DEFAULT_TICK_HZ};
+use project1990_sim::{
+    Dir, Map, RoundOutcome, SimConfig, SimInput, Team, Tile, WaveConfig, World, DEFAULT_TICK_HZ,
+};
 
 const TILE_PX: f32 = 32.0;
 const MAP_TEXT: &str = include_str!("../../../data/maps/test_level.txt");
@@ -59,11 +61,26 @@ struct HudLabel;
 #[derive(Resource)]
 struct ShowControlsHelp(bool);
 
-fn setup(mut commands: Commands) {
+fn make_world() -> World {
     let map = Map::parse(MAP_TEXT).expect("test_level.txt must parse");
-    let map_w = map.width() as f32;
-    let map_h = map.height() as f32;
-    let world = World::new(map, Default::default());
+    // Slightly shorter wave for verifying victory without a long grind.
+    World::new(
+        map,
+        SimConfig {
+            wave: WaveConfig {
+                total_enemies: 4,
+                max_on_field: 4,
+                spawn_interval: 2.0,
+            },
+            ..Default::default()
+        },
+    )
+}
+
+fn setup(mut commands: Commands) {
+    let world = make_world();
+    let map_w = world.map.width() as f32;
+    let map_h = world.map.height() as f32;
 
     commands.spawn(Camera2d);
     commands.insert_resource(ViewMeta { map_w, map_h });
@@ -252,16 +269,20 @@ fn hud_text(world: &World, show_help: bool) -> String {
         .player()
         .map(|p| if p.fire.autofire { "ON" } else { "off" })
         .unwrap_or("off");
-    let status = format!(
-        "enemies {on}/{max}  |  left {left}  |  destroyed {}  |  autofire {auto}",
-        world.wave.destroyed
-    );
+    let status = match world.outcome {
+        RoundOutcome::Playing => format!(
+            "enemies {on}/{max}  |  left {left}  |  destroyed {}  |  autofire {auto}",
+            world.wave.destroyed
+        ),
+        RoundOutcome::Victory => {
+            format!("VICTORY — wave cleared ({})", world.wave.destroyed)
+        }
+        RoundOutcome::DefeatBaseDestroyed => "DEFEAT — base destroyed".to_string(),
+    };
     if show_help {
-        format!(
-            "{status}\nWASD/arrows move   Space/J fire   K autofire   H hide controls"
-        )
+        format!("{status}\nWASD/arrows move   Space/J fire   K autofire   H hide help")
     } else {
-        format!("{status}   |   H show controls")
+        format!("{status}   |   H show help")
     }
 }
 

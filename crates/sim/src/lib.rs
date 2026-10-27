@@ -13,7 +13,7 @@ pub use map::{Map, MapError, SpawnPoint};
 pub use tile::Tile;
 pub use wave::{WaveConfig, WaveState};
 pub use world::{
-    Bullet, Dir, SimConfig, SimInput, Tank, Team, World, DEFAULT_TICK_HZ,
+    Bullet, Dir, RoundOutcome, SimConfig, SimInput, Tank, Team, World, DEFAULT_TICK_HZ,
 };
 
 /// Library version (workspace package version).

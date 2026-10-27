@@ -87,6 +87,17 @@ pub struct SimInput {
     pub toggle_autofire: bool,
 }
 
+/// End-of-round result for the current level attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RoundOutcome {
+    #[default]
+    Playing,
+    /// All enemies from the wave destroyed; base still standing.
+    Victory,
+    /// Base (eagle) was destroyed by a bullet.
+    DefeatBaseDestroyed,
+}
+
 /// Pure simulation state.
 #[derive(Debug, Clone)]
 pub struct World {
@@ -95,6 +106,7 @@ pub struct World {
     pub bullets: Vec<Bullet>,
     pub config: SimConfig,
     pub wave: WaveState,
+    pub outcome: RoundOutcome,
     pub tick: u64,
     next_id: u64,
     player_tank_id: u64,
@@ -111,6 +123,7 @@ impl World {
             bullets: Vec::new(),
             config,
             wave,
+            outcome: RoundOutcome::Playing,
             tick: 0,
             next_id: 1,
             player_tank_id: 0,
@@ -166,6 +179,10 @@ impl World {
 
     /// Apply input then advance simulation by `dt` seconds (usually `1.0 / tick_hz`).
     pub fn step(&mut self, input: &SimInput, dt: f32) {
+        if self.outcome != RoundOutcome::Playing {
+            return;
+        }
+
         if let Some(player) = self.player_mut() {
             player.move_dir = input.move_dir;
             if let Some(dir) = input.move_dir {
@@ -179,12 +196,23 @@ impl World {
 
         self.move_tanks(dt);
         self.fire_weapons(dt);
-        self.move_bullets(dt);
+        let base_hit = self.move_bullets(dt);
         self.resolve_bullet_tank_hits();
         // Spawn after combat so a dying tank frees a slot the same tick,
         // and leftover bullets don't instantly delete the newborn.
         self.spawn_enemies(dt);
+
+        if base_hit {
+            self.outcome = RoundOutcome::DefeatBaseDestroyed;
+        } else if self.wave.is_cleared(self.enemies_on_field()) {
+            self.outcome = RoundOutcome::Victory;
+        }
+
         self.tick += 1;
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.outcome == RoundOutcome::Playing
     }
 
     fn spawn_enemies(&mut self, dt: f32) {
@@ -376,7 +404,8 @@ impl World {
         }
     }
 
-    fn move_bullets(&mut self, dt: f32) {
+    /// Move bullets and apply tile hits. Returns `true` if the base was destroyed.
+    fn move_bullets(&mut self, dt: f32) -> bool {
         let speed = self.config.bullet_speed;
         let half = self.config.bullet_half;
         let mut remove = Vec::new();
@@ -414,7 +443,11 @@ impl World {
             }
         }
 
+        let mut base_destroyed = false;
         for (tx, ty) in tile_hits {
+            if self.map.get(tx, ty) == Some(Tile::Base) {
+                base_destroyed = true;
+            }
             let _ = self.map.set(tx, ty, Tile::Empty);
         }
 
@@ -424,6 +457,8 @@ impl World {
         for idx in remove.into_iter().rev() {
             self.bullets.swap_remove(idx);
         }
+
+        base_destroyed
     }
 
     /// Count live bullets owned by `tank_id`.
@@ -912,5 +947,109 @@ X......
             world.step(&SimInput::default(), 1.0 / 60.0);
         }
         assert_eq!(world.enemies_on_field(), 1);
+    }
+
+    #[test]
+    fn destroying_base_is_defeat() {
+        let mut world = World::new(
+            Map::parse(
+                "\
+...
+.P.
+.E.
+",
+            )
+            .unwrap(),
+            SimConfig {
+                bullet_speed: 40.0,
+                fire: FireConfig {
+                    fire_interval: 0.0,
+                    max_bullets: 2,
+                },
+                wave: WaveConfig {
+                    total_enemies: 0,
+                    max_on_field: 4,
+                    spawn_interval: 0.0,
+                },
+                ..Default::default()
+            },
+        );
+        {
+            let p = world.player_mut().unwrap();
+            p.x = 1.5;
+            p.y = 1.5;
+            p.dir = Dir::Down;
+            p.fire.cooldown = 0.0;
+        }
+        assert_eq!(world.map.get(1, 2), Some(Tile::Base));
+        for _ in 0..30 {
+            world.step(
+                &SimInput {
+                    fire_held: true,
+                    ..Default::default()
+                },
+                1.0 / 60.0,
+            );
+            if world.outcome != RoundOutcome::Playing {
+                break;
+            }
+        }
+        assert_eq!(world.outcome, RoundOutcome::DefeatBaseDestroyed);
+        assert_eq!(world.map.get(1, 2), Some(Tile::Empty));
+        // Frozen after defeat.
+        let tick = world.tick;
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        assert_eq!(world.tick, tick);
+    }
+
+    #[test]
+    fn clearing_wave_is_victory() {
+        let mut world = World::new(
+            Map::parse(
+                "\
+X......
+.......
+...P...
+",
+            )
+            .unwrap(),
+            SimConfig {
+                bullet_speed: 40.0,
+                fire: FireConfig {
+                    fire_interval: 0.0,
+                    max_bullets: 4,
+                },
+                wave: WaveConfig {
+                    total_enemies: 1,
+                    max_on_field: 1,
+                    spawn_interval: 0.0,
+                },
+                ..Default::default()
+            },
+        );
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        assert_eq!(world.enemies_on_field(), 1);
+        {
+            let p = world.player_mut().unwrap();
+            p.x = 0.5;
+            p.y = 2.5;
+            p.dir = Dir::Up;
+            p.fire.cooldown = 0.0;
+        }
+        for _ in 0..40 {
+            world.step(
+                &SimInput {
+                    fire_held: true,
+                    ..Default::default()
+                },
+                1.0 / 60.0,
+            );
+            if world.outcome != RoundOutcome::Playing {
+                break;
+            }
+        }
+        assert_eq!(world.outcome, RoundOutcome::Victory);
+        assert_eq!(world.wave.destroyed, 1);
+        assert!(world.wave.is_cleared(world.enemies_on_field()));
     }
 }
