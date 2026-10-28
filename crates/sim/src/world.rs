@@ -1,6 +1,7 @@
 //! Fixed-tick world: tanks, bullets, tile collisions.
 
 use crate::fire::{FireConfig, FireController};
+use crate::lives::{LivesConfig, PlayerProgress};
 use crate::map::Map;
 use crate::tile::Tile;
 use crate::wave::{WaveConfig, WaveState};
@@ -64,6 +65,9 @@ pub struct SimConfig {
     pub bullet_half: f32,
     pub fire: FireConfig,
     pub wave: WaveConfig,
+    pub lives: LivesConfig,
+    /// Enemy weapon (autofire while on field).
+    pub enemy_fire: FireConfig,
 }
 
 impl Default for SimConfig {
@@ -75,6 +79,11 @@ impl Default for SimConfig {
             bullet_half: 0.12,
             fire: FireConfig::default(),
             wave: WaveConfig::default(),
+            lives: LivesConfig::default(),
+            enemy_fire: FireConfig {
+                fire_interval: 1.2,
+                max_bullets: 1,
+            },
         }
     }
 }
@@ -96,6 +105,8 @@ pub enum RoundOutcome {
     Victory,
     /// Base (eagle) was destroyed by a bullet.
     DefeatBaseDestroyed,
+    /// Player lost the last life.
+    DefeatNoLives,
 }
 
 /// Pure simulation state.
@@ -106,6 +117,7 @@ pub struct World {
     pub bullets: Vec<Bullet>,
     pub config: SimConfig,
     pub wave: WaveState,
+    pub progress: PlayerProgress,
     pub outcome: RoundOutcome,
     pub tick: u64,
     next_id: u64,
@@ -117,38 +129,47 @@ pub struct World {
 impl World {
     pub fn new(map: Map, config: SimConfig) -> Self {
         let wave = WaveState::new(config.wave);
+        let progress = PlayerProgress::new(config.lives);
         let mut world = Self {
             map,
             tanks: Vec::new(),
             bullets: Vec::new(),
             config,
             wave,
+            progress,
             outcome: RoundOutcome::Playing,
             tick: 0,
             next_id: 1,
             player_tank_id: 0,
             next_enemy_spawn: 0,
         };
+        world.spawn_player_tank();
+        world
+    }
 
-        let spawn = world
+    fn player_spawn_pos(&self) -> (f32, f32) {
+        let spawn = self
             .map
             .player_spawns()
             .first()
             .copied()
             .unwrap_or(crate::map::SpawnPoint { x: 1, y: 1 });
+        (spawn.x as f32 + 0.5, spawn.y as f32 + 0.5)
+    }
 
-        let id = world.alloc_id();
-        world.player_tank_id = id;
-        world.tanks.push(Tank {
+    fn spawn_player_tank(&mut self) {
+        let (x, y) = self.player_spawn_pos();
+        let id = self.alloc_id();
+        self.player_tank_id = id;
+        self.tanks.push(Tank {
             id,
             team: Team::Player,
-            x: spawn.x as f32 + 0.5,
-            y: spawn.y as f32 + 0.5,
+            x,
+            y,
             dir: Dir::Up,
-            fire: FireController::new(world.config.fire),
+            fire: FireController::new(self.config.fire),
             move_dir: None,
         });
-        world
     }
 
     pub fn enemies_on_field(&self) -> u32 {
@@ -183,6 +204,8 @@ impl World {
             return;
         }
 
+        self.progress.tick_invuln(dt);
+
         if let Some(player) = self.player_mut() {
             player.move_dir = input.move_dir;
             if let Some(dir) = input.move_dir {
@@ -197,6 +220,7 @@ impl World {
         self.move_tanks(dt);
         self.fire_weapons(dt);
         let base_hit = self.move_bullets(dt);
+        self.resolve_bullet_bullet_hits();
         self.resolve_bullet_tank_hits();
         // Spawn after combat so a dying tank frees a slot the same tick,
         // and leftover bullets don't instantly delete the newborn.
@@ -204,7 +228,9 @@ impl World {
 
         if base_hit {
             self.outcome = RoundOutcome::DefeatBaseDestroyed;
-        } else if self.wave.is_cleared(self.enemies_on_field()) {
+        } else if self.outcome == RoundOutcome::Playing
+            && self.wave.is_cleared(self.enemies_on_field())
+        {
             self.outcome = RoundOutcome::Victory;
         }
 
@@ -241,14 +267,16 @@ impl World {
             }
 
             let id = self.alloc_id();
+            let mut fire = FireController::new(self.config.enemy_fire);
+            fire.autofire = true;
             self.tanks.push(Tank {
                 id,
                 team: Team::Enemy,
                 x: cx,
                 y: cy,
                 dir: Dir::Down,
-                fire: FireController::new(self.config.fire),
-                // Phase 2.1: stationary — visible spawn/limit; AI is phase 4.
+                fire,
+                // Stationary for now; AI is phase 4. They still shoot downward.
                 move_dir: None,
             });
             self.wave.on_spawned();
@@ -272,9 +300,44 @@ impl World {
         false
     }
 
+    /// Any overlapping bullets cancel each other (including same team).
+    fn resolve_bullet_bullet_hits(&mut self) {
+        let half = self.config.bullet_half;
+        let n = self.bullets.len();
+        if n < 2 {
+            return;
+        }
+        let mut dead = vec![false; n];
+        for i in 0..n {
+            if dead[i] {
+                continue;
+            }
+            for j in (i + 1)..n {
+                if dead[j] {
+                    continue;
+                }
+                let a = &self.bullets[i];
+                let b = &self.bullets[j];
+                let dx = (a.x - b.x).abs();
+                let dy = (a.y - b.y).abs();
+                if dx < half * 2.0 && dy < half * 2.0 {
+                    dead[i] = true;
+                    dead[j] = true;
+                    break;
+                }
+            }
+        }
+        for i in (0..n).rev() {
+            if dead[i] {
+                self.bullets.swap_remove(i);
+            }
+        }
+    }
+
     fn resolve_bullet_tank_hits(&mut self) {
         let half_b = self.config.bullet_half;
         let half_t = self.config.tank_half;
+        let player_invuln = self.progress.is_invulnerable();
         let mut dead_bullets = Vec::new();
         let mut dead_tanks = Vec::new();
 
@@ -287,7 +350,11 @@ impl World {
                 let dy = (tank.y - bullet.y).abs();
                 if dx < half_t + half_b && dy < half_t + half_b {
                     dead_bullets.push(bi);
-                    dead_tanks.push(tank.id);
+                    if tank.team == Team::Player && player_invuln {
+                        // Bullet is spent; tank survives.
+                    } else {
+                        dead_tanks.push(tank.id);
+                    }
                     break;
                 }
             }
@@ -301,14 +368,31 @@ impl World {
 
         dead_tanks.sort_unstable();
         dead_tanks.dedup();
+        let mut player_died = false;
         for tid in dead_tanks {
             if let Some(pos) = self.tanks.iter().position(|t| t.id == tid) {
                 let team = self.tanks[pos].team;
                 self.tanks.swap_remove(pos);
-                if team == Team::Enemy {
-                    self.wave.on_destroyed();
-                }
                 self.bullets.retain(|b| b.owner_id != tid);
+                match team {
+                    Team::Enemy => {
+                        self.wave.on_destroyed();
+                        self.progress
+                            .add_score(self.config.lives.points_per_enemy);
+                    }
+                    Team::Player => {
+                        player_died = true;
+                    }
+                }
+            }
+        }
+
+        if player_died {
+            if self.progress.on_tank_destroyed() {
+                self.spawn_player_tank();
+                self.progress.start_invuln();
+            } else {
+                self.outcome = RoundOutcome::DefeatNoLives;
             }
         }
     }
@@ -490,6 +574,7 @@ mod tests {
                     max_on_field: 4,
                     spawn_interval: 0.0,
                 },
+                ..Default::default()
             },
         )
     }
@@ -691,6 +776,7 @@ P
                     max_on_field: 4,
                     spawn_interval: 0.0,
                 },
+                ..Default::default()
             },
         );
         {
@@ -1051,5 +1137,225 @@ X......
         assert_eq!(world.outcome, RoundOutcome::Victory);
         assert_eq!(world.wave.destroyed, 1);
         assert!(world.wave.is_cleared(world.enemies_on_field()));
+    }
+
+    #[test]
+    fn player_death_respawns_with_invuln_until_lives_out() {
+        let mut world = World::new(
+            Map::parse(
+                "\
+.....
+..P..
+.....
+",
+            )
+            .unwrap(),
+            SimConfig {
+                lives: LivesConfig {
+                    starting_lives: 2,
+                    max_lives: 5,
+                    life_every_points: 20_000,
+                    invuln_secs: 2.0,
+                    points_per_enemy: 100,
+                },
+                wave: WaveConfig {
+                    total_enemies: 0,
+                    max_on_field: 4,
+                    spawn_interval: 0.0,
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(world.progress.lives, 2);
+        let first_id = world.player_tank_id();
+
+        // Simulate enemy bullet hit: spawn hostile bullet on player.
+        let bid = world.alloc_id();
+        let (px, py) = {
+            let p = world.player().unwrap();
+            (p.x, p.y)
+        };
+        world.bullets.push(Bullet {
+            id: bid,
+            owner_id: 999,
+            team: Team::Enemy,
+            x: px,
+            y: py,
+            dir: Dir::Down,
+        });
+        world.resolve_bullet_tank_hits();
+        assert_eq!(world.progress.lives, 1);
+        assert!(world.progress.is_invulnerable());
+        assert_ne!(world.player_tank_id(), first_id);
+        assert_eq!(world.outcome, RoundOutcome::Playing);
+
+        // Second death while vulnerable → game over.
+        world.progress.invuln_remaining = 0.0;
+        let bid2 = world.alloc_id();
+        let (px, py) = {
+            let p = world.player().unwrap();
+            (p.x, p.y)
+        };
+        world.bullets.push(Bullet {
+            id: bid2,
+            owner_id: 999,
+            team: Team::Enemy,
+            x: px,
+            y: py,
+            dir: Dir::Down,
+        });
+        world.resolve_bullet_tank_hits();
+        assert_eq!(world.progress.lives, 0);
+        assert_eq!(world.outcome, RoundOutcome::DefeatNoLives);
+        assert!(world.player().is_none());
+    }
+
+    #[test]
+    fn invulnerable_player_ignores_hits() {
+        let mut world = tiny_world(
+            "\
+...
+.P.
+...
+",
+        );
+        world.progress.start_invuln();
+        let id = world.player_tank_id();
+        world.bullets.push(Bullet {
+            id: 50,
+            owner_id: 999,
+            team: Team::Enemy,
+            x: world.player().unwrap().x,
+            y: world.player().unwrap().y,
+            dir: Dir::Up,
+        });
+        world.resolve_bullet_tank_hits();
+        assert_eq!(world.player_tank_id(), id);
+        assert_eq!(world.progress.lives, world.config.lives.starting_lives);
+        assert!(world.bullets.is_empty());
+    }
+
+    #[test]
+    fn killing_enemy_can_grant_life_at_threshold() {
+        let mut world = World::new(
+            Map::parse(
+                "\
+X......
+.......
+...P...
+",
+            )
+            .unwrap(),
+            SimConfig {
+                bullet_speed: 40.0,
+                fire: FireConfig {
+                    fire_interval: 0.0,
+                    max_bullets: 4,
+                },
+                wave: WaveConfig {
+                    total_enemies: 1,
+                    max_on_field: 1,
+                    spawn_interval: 0.0,
+                },
+                lives: LivesConfig {
+                    starting_lives: 3,
+                    max_lives: 5,
+                    life_every_points: 100,
+                    invuln_secs: 1.0,
+                    points_per_enemy: 100,
+                },
+                enemy_fire: FireConfig {
+                    fire_interval: 999.0,
+                    max_bullets: 0,
+                },
+                ..Default::default()
+            },
+        );
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        {
+            let p = world.player_mut().unwrap();
+            p.x = 0.5;
+            p.y = 2.5;
+            p.dir = Dir::Up;
+            p.fire.cooldown = 0.0;
+        }
+        for _ in 0..40 {
+            world.step(
+                &SimInput {
+                    fire_held: true,
+                    ..Default::default()
+                },
+                1.0 / 60.0,
+            );
+            if world.outcome != RoundOutcome::Playing {
+                break;
+            }
+        }
+        assert_eq!(world.progress.score, 100);
+        assert_eq!(world.progress.lives, 4);
+    }
+
+    #[test]
+    fn opposing_bullets_cancel_each_other() {
+        let mut world = tiny_world(
+            "\
+.....
+..P..
+.....
+",
+        );
+        world.bullets.push(Bullet {
+            id: 1,
+            owner_id: world.player_tank_id(),
+            team: Team::Player,
+            x: 2.5,
+            y: 2.0,
+            dir: Dir::Up,
+        });
+        world.bullets.push(Bullet {
+            id: 2,
+            owner_id: 999,
+            team: Team::Enemy,
+            x: 2.5,
+            y: 2.05,
+            dir: Dir::Down,
+        });
+        world.resolve_bullet_bullet_hits();
+        assert!(
+            world.bullets.is_empty(),
+            "player and enemy bullets must destroy each other"
+        );
+    }
+
+    #[test]
+    fn same_team_bullets_also_cancel() {
+        let mut world = tiny_world(
+            "\
+.....
+..P..
+.....
+",
+        );
+        world.bullets.push(Bullet {
+            id: 1,
+            owner_id: 1,
+            team: Team::Enemy,
+            x: 2.5,
+            y: 2.0,
+            dir: Dir::Down,
+        });
+        world.bullets.push(Bullet {
+            id: 2,
+            owner_id: 2,
+            team: Team::Enemy,
+            x: 2.5,
+            y: 2.05,
+            dir: Dir::Down,
+        });
+        world.resolve_bullet_bullet_hits();
+        assert!(
+            world.bullets.is_empty(),
+            "ally/enemy same-team bullets must cancel too"
+        );
     }
 }

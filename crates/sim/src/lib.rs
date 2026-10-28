@@ -3,12 +3,14 @@
 //! No GPU/window dependencies — unit-testable and ready for a future dedicated server.
 
 mod fire;
+mod lives;
 mod map;
 mod tile;
 mod wave;
 mod world;
 
 pub use fire::{FireConfig, FireController};
+pub use lives::{LivesConfig, PlayerProgress};
 pub use map::{Map, MapError, SpawnPoint};
 pub use tile::Tile;
 pub use wave::{WaveConfig, WaveState};

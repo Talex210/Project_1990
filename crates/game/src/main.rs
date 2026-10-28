@@ -4,7 +4,8 @@
 
 use bevy::prelude::*;
 use project1990_sim::{
-    Dir, Map, RoundOutcome, SimConfig, SimInput, Team, Tile, WaveConfig, World, DEFAULT_TICK_HZ,
+    Dir, LivesConfig, Map, RoundOutcome, SimConfig, SimInput, Team, Tile, WaveConfig, World,
+    DEFAULT_TICK_HZ,
 };
 
 const TILE_PX: f32 = 32.0;
@@ -63,7 +64,6 @@ struct ShowControlsHelp(bool);
 
 fn make_world() -> World {
     let map = Map::parse(MAP_TEXT).expect("test_level.txt must parse");
-    // Slightly shorter wave for verifying victory without a long grind.
     World::new(
         map,
         SimConfig {
@@ -71,6 +71,14 @@ fn make_world() -> World {
                 total_enemies: 4,
                 max_on_field: 4,
                 spawn_interval: 2.0,
+            },
+            // Lower threshold in playtest so +1 life is easy to see (prod default 20_000).
+            lives: LivesConfig {
+                starting_lives: 3,
+                max_lives: 5,
+                life_every_points: 200,
+                invuln_secs: 3.0,
+                points_per_enemy: 100,
             },
             ..Default::default()
         },
@@ -138,9 +146,13 @@ fn read_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut frame: ResMut<FrameInput>,
     mut help: ResMut<ShowControlsHelp>,
+    mut sim: ResMut<SimWorld>,
 ) {
     if keys.just_pressed(KeyCode::KeyH) {
         help.0 = !help.0;
+    }
+    if keys.just_pressed(KeyCode::KeyR) {
+        *sim = SimWorld(make_world());
     }
 
     let move_dir = if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) {
@@ -194,6 +206,9 @@ fn sync_view(
         text.0 = hud_text(&sim.0, help.0);
     }
 
+    let invuln = sim.0.progress.is_invulnerable();
+    let blink_on = !invuln || ((sim.0.tick / 8) % 2 == 0);
+
     let live_tanks: Vec<(u64, Team, f32, f32, Dir)> = sim
         .0
         .tanks
@@ -210,7 +225,15 @@ fn sync_view(
             tf.translation.x = bx;
             tf.translation.y = by;
             tf.rotation = Quat::from_rotation_z(dir_angle(*dir));
-            sprite.color = team_color(*team);
+            let mut color = team_color(*team);
+            if *team == Team::Player && invuln {
+                color = if blink_on {
+                    Color::srgb(0.85, 1.0, 0.9)
+                } else {
+                    Color::srgba(0.2, 0.85, 0.35, 0.25)
+                };
+            }
+            sprite.color = color;
             seen_tanks.push(marker.sim_id);
         } else {
             commands.entity(entity).despawn();
@@ -265,22 +288,30 @@ fn hud_text(world: &World, show_help: bool) -> String {
     let on = world.enemies_on_field();
     let max = world.wave.config.max_on_field;
     let left = world.wave.remaining_in_wave(on);
+    let lives = world.progress.lives;
+    let score = world.progress.score;
     let auto = world
         .player()
         .map(|p| if p.fire.autofire { "ON" } else { "off" })
         .unwrap_or("off");
     let status = match world.outcome {
         RoundOutcome::Playing => format!(
-            "enemies {on}/{max}  |  left {left}  |  destroyed {}  |  autofire {auto}",
-            world.wave.destroyed
+            "lives {lives}  |  score {score}  |  enemies {on}/{max}  |  left {left}  |  autofire {auto}"
         ),
         RoundOutcome::Victory => {
-            format!("VICTORY — wave cleared ({})", world.wave.destroyed)
+            format!("VICTORY — score {score}  |  R restart")
         }
-        RoundOutcome::DefeatBaseDestroyed => "DEFEAT — base destroyed".to_string(),
+        RoundOutcome::DefeatBaseDestroyed => {
+            format!("DEFEAT — base destroyed  |  score {score}  |  R restart")
+        }
+        RoundOutcome::DefeatNoLives => {
+            format!("DEFEAT — no lives  |  score {score}  |  R restart")
+        }
     };
     if show_help {
-        format!("{status}\nWASD/arrows move   Space/J fire   K autofire   H hide help")
+        format!(
+            "{status}\nWASD move  Space/J fire  K autofire  H hide help  R restart"
+        )
     } else {
         format!("{status}   |   H show help")
     }
