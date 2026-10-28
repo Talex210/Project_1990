@@ -4,12 +4,13 @@
 
 use bevy::prelude::*;
 use project1990_sim::{
-    Dir, LivesConfig, Map, RoundOutcome, SimConfig, SimInput, Team, Tile, WaveConfig, World,
-    DEFAULT_TICK_HZ,
+    Dir, LivesConfig, Map, RoundOutcome, ScoreConfig, SimConfig, SimInput, Team, Tile, WaveConfig,
+    World, DEFAULT_TICK_HZ,
 };
 
 const TILE_PX: f32 = 32.0;
 const MAP_TEXT: &str = include_str!("../../../data/maps/test_level.txt");
+const SCORE_CFG: &str = include_str!("../../../data/score.cfg");
 
 fn main() {
     App::new()
@@ -64,6 +65,7 @@ struct ShowControlsHelp(bool);
 
 fn make_world() -> World {
     let map = Map::parse(MAP_TEXT).expect("test_level.txt must parse");
+    let score = ScoreConfig::parse(SCORE_CFG).expect("data/score.cfg");
     World::new(
         map,
         SimConfig {
@@ -78,8 +80,8 @@ fn make_world() -> World {
                 max_lives: 5,
                 life_every_points: 200,
                 invuln_secs: 3.0,
-                points_per_enemy: 100,
             },
+            score,
             ..Default::default()
         },
     )
@@ -290,28 +292,44 @@ fn hud_text(world: &World, show_help: bool) -> String {
     let left = world.wave.remaining_in_wave(on);
     let lives = world.progress.lives;
     let score = world.progress.score;
+    let streak = world.style.streak;
     let auto = world
         .player()
         .map(|p| if p.fire.autofire { "ON" } else { "off" })
         .unwrap_or("off");
+    let popup = world
+        .style
+        .last_popup
+        .as_ref()
+        .map(|p| p.label())
+        .unwrap_or_default();
+
     let status = match world.outcome {
-        RoundOutcome::Playing => format!(
-            "lives {lives}  |  score {score}  |  enemies {on}/{max}  |  left {left}  |  autofire {auto}"
-        ),
+        RoundOutcome::Playing => {
+            let mut line = format!(
+                "SCORE {score}   lives {lives}   streak x{streak}   enemies {on}/{max} left {left}   autofire {auto}"
+            );
+            if !popup.is_empty() {
+                line.push_str(&format!("\n{popup}"));
+            }
+            line
+        }
         RoundOutcome::Victory => {
-            format!("VICTORY — score {score}  |  R restart")
+            let mut line = format!("VICTORY — SCORE {score}  |  R restart");
+            if !popup.is_empty() {
+                line.push_str(&format!("\n{popup}"));
+            }
+            line
         }
         RoundOutcome::DefeatBaseDestroyed => {
-            format!("DEFEAT — base destroyed  |  score {score}  |  R restart")
+            format!("DEFEAT — base destroyed  |  SCORE {score}  |  R restart")
         }
         RoundOutcome::DefeatNoLives => {
-            format!("DEFEAT — no lives  |  score {score}  |  R restart")
+            format!("DEFEAT — no lives  |  SCORE {score}  |  R restart")
         }
     };
     if show_help {
-        format!(
-            "{status}\nWASD move  Space/J fire  K autofire  H hide help  R restart"
-        )
+        format!("{status}\nWASD move  Space/J fire  K autofire  H hide help  R restart")
     } else {
         format!("{status}   |   H show help")
     }

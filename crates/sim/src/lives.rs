@@ -10,8 +10,6 @@ pub struct LivesConfig {
     pub life_every_points: u32,
     /// Seconds of invulnerability after respawn.
     pub invuln_secs: f32,
-    /// Stub points per enemy kill until full score table (phase 2.4).
-    pub points_per_enemy: u32,
 }
 
 impl Default for LivesConfig {
@@ -21,7 +19,6 @@ impl Default for LivesConfig {
             max_lives: 5,
             life_every_points: 20_000,
             invuln_secs: 3.0,
-            points_per_enemy: 100,
         }
     }
 }
@@ -66,7 +63,10 @@ impl PlayerProgress {
 
     /// Add score and award +1 life for each newly crossed threshold. Returns lives gained.
     pub fn add_score(&mut self, points: u32) -> u32 {
-        if points == 0 || self.config.life_every_points == 0 {
+        if points == 0 {
+            return 0;
+        }
+        if self.config.life_every_points == 0 {
             self.score = self.score.saturating_add(points);
             return 0;
         }
@@ -99,7 +99,6 @@ impl PlayerProgress {
             return false;
         }
         self.lives -= 1;
-        // starting 3 → three tanks total; after last decrement to 0, no respawn.
         self.lives > 0
     }
 }
@@ -115,13 +114,12 @@ mod tests {
             max_lives: 10,
             life_every_points: 100,
             invuln_secs: 1.0,
-            points_per_enemy: 100,
         });
         assert_eq!(p.add_score(99), 0);
         assert_eq!(p.lives, 3);
         assert_eq!(p.add_score(1), 1);
         assert_eq!(p.lives, 4);
-        assert_eq!(p.add_score(200), 2); // crosses 200 and 300
+        assert_eq!(p.add_score(200), 2);
         assert_eq!(p.lives, 6);
     }
 
@@ -132,9 +130,8 @@ mod tests {
             max_lives: 5,
             life_every_points: 50,
             invuln_secs: 1.0,
-            points_per_enemy: 100,
         });
-        assert_eq!(p.add_score(200), 1); // only one fits under cap
+        assert_eq!(p.add_score(200), 1);
         assert_eq!(p.lives, 5);
     }
 }

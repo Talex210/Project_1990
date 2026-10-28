@@ -3,6 +3,7 @@
 use crate::fire::{FireConfig, FireController};
 use crate::lives::{LivesConfig, PlayerProgress};
 use crate::map::Map;
+use crate::score::{EnemyKind, ScoreConfig, StyleState};
 use crate::tile::Tile;
 use crate::wave::{WaveConfig, WaveState};
 
@@ -38,6 +39,8 @@ pub enum Team {
 pub struct Tank {
     pub id: u64,
     pub team: Team,
+    /// Scoring weight when this tank is an enemy.
+    pub enemy_kind: EnemyKind,
     /// Center position in tile coordinates.
     pub x: f32,
     pub y: f32,
@@ -66,6 +69,7 @@ pub struct SimConfig {
     pub fire: FireConfig,
     pub wave: WaveConfig,
     pub lives: LivesConfig,
+    pub score: ScoreConfig,
     /// Enemy weapon (autofire while on field).
     pub enemy_fire: FireConfig,
 }
@@ -80,6 +84,7 @@ impl Default for SimConfig {
             fire: FireConfig::default(),
             wave: WaveConfig::default(),
             lives: LivesConfig::default(),
+            score: ScoreConfig::default(),
             enemy_fire: FireConfig {
                 fire_interval: 1.2,
                 max_bullets: 1,
@@ -118,6 +123,7 @@ pub struct World {
     pub config: SimConfig,
     pub wave: WaveState,
     pub progress: PlayerProgress,
+    pub style: StyleState,
     pub outcome: RoundOutcome,
     pub tick: u64,
     next_id: u64,
@@ -137,6 +143,7 @@ impl World {
             config,
             wave,
             progress,
+            style: StyleState::default(),
             outcome: RoundOutcome::Playing,
             tick: 0,
             next_id: 1,
@@ -164,6 +171,7 @@ impl World {
         self.tanks.push(Tank {
             id,
             team: Team::Player,
+            enemy_kind: EnemyKind::Basic,
             x,
             y,
             dir: Dir::Up,
@@ -227,10 +235,13 @@ impl World {
         self.spawn_enemies(dt);
 
         if base_hit {
+            self.style.on_base_hit();
             self.outcome = RoundOutcome::DefeatBaseDestroyed;
         } else if self.outcome == RoundOutcome::Playing
             && self.wave.is_cleared(self.enemies_on_field())
         {
+            let (bonus, _) = self.style.award_clear(&self.config.score);
+            self.progress.add_score(bonus);
             self.outcome = RoundOutcome::Victory;
         }
 
@@ -272,6 +283,7 @@ impl World {
             self.tanks.push(Tank {
                 id,
                 team: Team::Enemy,
+                enemy_kind: EnemyKind::Basic,
                 x: cx,
                 y: cy,
                 dir: Dir::Down,
@@ -372,13 +384,14 @@ impl World {
         for tid in dead_tanks {
             if let Some(pos) = self.tanks.iter().position(|t| t.id == tid) {
                 let team = self.tanks[pos].team;
+                let kind = self.tanks[pos].enemy_kind;
                 self.tanks.swap_remove(pos);
                 self.bullets.retain(|b| b.owner_id != tid);
                 match team {
                     Team::Enemy => {
                         self.wave.on_destroyed();
-                        self.progress
-                            .add_score(self.config.lives.points_per_enemy);
+                        let (pts, _) = self.style.award_kill(&self.config.score, kind);
+                        self.progress.add_score(pts);
                     }
                     Team::Player => {
                         player_died = true;
@@ -388,6 +401,7 @@ impl World {
         }
 
         if player_died {
+            self.style.on_player_death();
             if self.progress.on_tank_destroyed() {
                 self.spawn_player_tank();
                 self.progress.start_invuln();
@@ -555,6 +569,7 @@ impl World {
 mod tests {
     use super::*;
     use crate::map::Map;
+    use crate::score::ScoreConfig;
 
     fn tiny_world(map: &str) -> World {
         let map = Map::parse(map).unwrap();
@@ -1156,7 +1171,6 @@ X......
                     max_lives: 5,
                     life_every_points: 20_000,
                     invuln_secs: 2.0,
-                    points_per_enemy: 100,
                 },
                 wave: WaveConfig {
                     total_enemies: 0,
@@ -1262,7 +1276,14 @@ X......
                     max_lives: 5,
                     life_every_points: 100,
                     invuln_secs: 1.0,
-                    points_per_enemy: 100,
+                },
+                score: ScoreConfig {
+                    enemy_basic: 100,
+                    streak_bonus_per_step: 0,
+                    clear_bonus: 0,
+                    clear_no_death_bonus: 0,
+                    clear_base_safe_bonus: 0,
+                    ..Default::default()
                 },
                 enemy_fire: FireConfig {
                     fire_interval: 999.0,
@@ -1293,6 +1314,70 @@ X......
         }
         assert_eq!(world.progress.score, 100);
         assert_eq!(world.progress.lives, 4);
+    }
+
+    #[test]
+    fn victory_awards_clear_style_bonuses() {
+        let mut world = World::new(
+            Map::parse(
+                "\
+X......
+.......
+...P...
+",
+            )
+            .unwrap(),
+            SimConfig {
+                bullet_speed: 40.0,
+                fire: FireConfig {
+                    fire_interval: 0.0,
+                    max_bullets: 4,
+                },
+                wave: WaveConfig {
+                    total_enemies: 1,
+                    max_on_field: 1,
+                    spawn_interval: 0.0,
+                },
+                score: ScoreConfig {
+                    enemy_basic: 100,
+                    streak_bonus_per_step: 0,
+                    clear_bonus: 500,
+                    clear_no_death_bonus: 1000,
+                    clear_base_safe_bonus: 500,
+                    ..Default::default()
+                },
+                enemy_fire: FireConfig {
+                    fire_interval: 999.0,
+                    max_bullets: 0,
+                },
+                ..Default::default()
+            },
+        );
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        {
+            let p = world.player_mut().unwrap();
+            p.x = 0.5;
+            p.y = 2.5;
+            p.dir = Dir::Up;
+            p.fire.cooldown = 0.0;
+        }
+        for _ in 0..40 {
+            world.step(
+                &SimInput {
+                    fire_held: true,
+                    ..Default::default()
+                },
+                1.0 / 60.0,
+            );
+            if world.outcome != RoundOutcome::Playing {
+                break;
+            }
+        }
+        assert_eq!(world.outcome, RoundOutcome::Victory);
+        // kill 100 + clear 500 + no-death 1000 + base-safe 500
+        assert_eq!(world.progress.score, 2100);
+        assert_eq!(world.style.streak, 1);
+        assert_eq!(world.style.deaths_this_level, 0);
     }
 
     #[test]

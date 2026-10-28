@@ -5,6 +5,7 @@
 mod fire;
 mod lives;
 mod map;
+mod score;
 mod tile;
 mod wave;
 mod world;
@@ -12,6 +13,7 @@ mod world;
 pub use fire::{FireConfig, FireController};
 pub use lives::{LivesConfig, PlayerProgress};
 pub use map::{Map, MapError, SpawnPoint};
+pub use score::{EnemyKind, ScoreConfig, ScorePopup, StyleState};
 pub use tile::Tile;
 pub use wave::{WaveConfig, WaveState};
 pub use world::{
