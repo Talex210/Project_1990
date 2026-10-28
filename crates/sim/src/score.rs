@@ -21,7 +21,6 @@ pub struct ScoreConfig {
     pub streak_bonus_per_step: u32,
     pub clear_bonus: u32,
     pub clear_no_death_bonus: u32,
-    pub clear_base_safe_bonus: u32,
 }
 
 impl Default for ScoreConfig {
@@ -33,7 +32,6 @@ impl Default for ScoreConfig {
             streak_bonus_per_step: 50,
             clear_bonus: 500,
             clear_no_death_bonus: 1000,
-            clear_base_safe_bonus: 500,
         }
     }
 }
@@ -70,7 +68,8 @@ impl ScoreConfig {
                 "streak_bonus_per_step" => cfg.streak_bonus_per_step = val,
                 "clear_bonus" => cfg.clear_bonus = val,
                 "clear_no_death_bonus" => cfg.clear_no_death_bonus = val,
-                "clear_base_safe_bonus" => cfg.clear_base_safe_bonus = val,
+                // Ignored legacy key (base-safe bonus removed — classic: base hit = game over).
+                "clear_base_safe_bonus" => {}
                 other => {
                     return Err(ScoreParseError::UnknownKey {
                         line: line_no + 1,
@@ -93,7 +92,9 @@ pub enum ScoreParseError {
 impl fmt::Display for ScoreParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ScoreParseError::BadLine { line } => write!(f, "score.cfg line {line}: expected key=value"),
+            ScoreParseError::BadLine { line } => {
+                write!(f, "score.cfg line {line}: expected key=value")
+            }
             ScoreParseError::BadValue { line, key } => {
                 write!(f, "score.cfg line {line}: bad value for {key}")
             }
@@ -115,11 +116,7 @@ pub enum ScorePopup {
         streak_bonus: u32,
         streak: u32,
     },
-    Clear {
-        clear: u32,
-        no_death: u32,
-        base_safe: u32,
-    },
+    Clear { clear: u32, no_death: u32 },
 }
 
 impl ScorePopup {
@@ -130,11 +127,7 @@ impl ScorePopup {
                 streak_bonus,
                 ..
             } => base + streak_bonus,
-            ScorePopup::Clear {
-                clear,
-                no_death,
-                base_safe,
-            } => clear + no_death + base_safe,
+            ScorePopup::Clear { clear, no_death } => clear + no_death,
         }
     }
 
@@ -147,22 +140,18 @@ impl ScorePopup {
                 ..
             } => {
                 if *streak_bonus > 0 {
-                    format!("+{} (kill)  streak x{streak} +{streak_bonus}", base + streak_bonus)
+                    format!(
+                        "+{} (kill)  streak x{streak} +{streak_bonus}",
+                        base + streak_bonus
+                    )
                 } else {
                     format!("+{base} (kill)")
                 }
             }
-            ScorePopup::Clear {
-                clear,
-                no_death,
-                base_safe,
-            } => {
+            ScorePopup::Clear { clear, no_death } => {
                 let mut parts = vec![format!("clear +{clear}")];
                 if *no_death > 0 {
                     parts.push(format!("no-death +{no_death}"));
-                }
-                if *base_safe > 0 {
-                    parts.push(format!("base safe +{base_safe}"));
                 }
                 parts.join("  |  ")
             }
@@ -177,8 +166,6 @@ pub struct StyleState {
     pub streak: u32,
     /// Deaths this level (for clear-no-death bonus).
     pub deaths_this_level: u32,
-    /// True if the base took any bullet damage this level.
-    pub base_damaged: bool,
     pub last_popup: Option<ScorePopup>,
 }
 
@@ -187,10 +174,6 @@ impl StyleState {
         self.streak = 0;
         self.deaths_this_level = self.deaths_this_level.saturating_add(1);
         self.last_popup = None;
-    }
-
-    pub fn on_base_hit(&mut self) {
-        self.base_damaged = true;
     }
 
     /// Points for one enemy kill including streak step bonus.
@@ -220,18 +203,9 @@ impl StyleState {
         } else {
             0
         };
-        let base_safe = if !self.base_damaged {
-            cfg.clear_base_safe_bonus
-        } else {
-            0
-        };
-        let popup = ScorePopup::Clear {
-            clear,
-            no_death,
-            base_safe,
-        };
+        let popup = ScorePopup::Clear { clear, no_death };
         self.last_popup = Some(popup.clone());
-        (clear + no_death + base_safe, popup)
+        (clear + no_death, popup)
     }
 }
 
@@ -251,7 +225,7 @@ streak_bonus_per_step=25
         .unwrap();
         assert_eq!(cfg.enemy_basic, 150);
         assert_eq!(cfg.streak_bonus_per_step, 25);
-        assert_eq!(cfg.clear_bonus, 500); // default kept
+        assert_eq!(cfg.clear_bonus, 500);
     }
 
     #[test]
@@ -264,35 +238,26 @@ streak_bonus_per_step=25
         let mut style = StyleState::default();
         let (p1, _) = style.award_kill(&cfg, EnemyKind::Basic);
         assert_eq!(p1, 100);
-        assert_eq!(style.streak, 1);
         let (p2, _) = style.award_kill(&cfg, EnemyKind::Basic);
-        assert_eq!(p2, 150); // 100 + 50
+        assert_eq!(p2, 150);
         style.on_player_death();
         assert_eq!(style.streak, 0);
         assert_eq!(style.deaths_this_level, 1);
     }
 
     #[test]
-    fn clear_bonuses_respect_flags() {
+    fn clear_bonuses_respect_deaths() {
         let cfg = ScoreConfig::default();
         let mut style = StyleState::default();
         let (pts, pop) = style.award_clear(&cfg);
-        assert_eq!(pts, 500 + 1000 + 500);
+        assert_eq!(pts, 500 + 1000);
         match pop {
-            ScorePopup::Clear {
-                no_death,
-                base_safe,
-                ..
-            } => {
-                assert_eq!(no_death, 1000);
-                assert_eq!(base_safe, 500);
-            }
+            ScorePopup::Clear { no_death, .. } => assert_eq!(no_death, 1000),
             _ => panic!("expected clear"),
         }
 
         let mut dirty = StyleState {
             deaths_this_level: 1,
-            base_damaged: true,
             ..Default::default()
         };
         let (pts2, _) = dirty.award_clear(&cfg);

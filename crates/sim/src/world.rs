@@ -235,7 +235,6 @@ impl World {
         self.spawn_enemies(dt);
 
         if base_hit {
-            self.style.on_base_hit();
             self.outcome = RoundOutcome::DefeatBaseDestroyed;
         } else if self.outcome == RoundOutcome::Playing
             && self.wave.is_cleared(self.enemies_on_field())
@@ -1282,7 +1281,6 @@ X......
                     streak_bonus_per_step: 0,
                     clear_bonus: 0,
                     clear_no_death_bonus: 0,
-                    clear_base_safe_bonus: 0,
                     ..Default::default()
                 },
                 enemy_fire: FireConfig {
@@ -1343,7 +1341,6 @@ X......
                     streak_bonus_per_step: 0,
                     clear_bonus: 500,
                     clear_no_death_bonus: 1000,
-                    clear_base_safe_bonus: 500,
                     ..Default::default()
                 },
                 enemy_fire: FireConfig {
@@ -1374,8 +1371,8 @@ X......
             }
         }
         assert_eq!(world.outcome, RoundOutcome::Victory);
-        // kill 100 + clear 500 + no-death 1000 + base-safe 500
-        assert_eq!(world.progress.score, 2100);
+        // kill 100 + clear 500 + no-death 1000
+        assert_eq!(world.progress.score, 1600);
         assert_eq!(world.style.streak, 1);
         assert_eq!(world.style.deaths_this_level, 0);
     }

@@ -3,12 +3,15 @@
 //! Simulation lives in `project1990-sim`; this binary only renders and feeds input.
 
 use bevy::prelude::*;
+use bevy::sprite::Anchor;
 use project1990_sim::{
     Dir, LivesConfig, Map, RoundOutcome, ScoreConfig, SimConfig, SimInput, Team, Tile, WaveConfig,
     World, DEFAULT_TICK_HZ,
 };
 
 const TILE_PX: f32 = 32.0;
+/// Reserved space above the map so Playing HUD does not cover tiles.
+const HUD_BAND_PX: f32 = 100.0;
 const MAP_TEXT: &str = include_str!("../../../data/maps/test_level.txt");
 const SCORE_CFG: &str = include_str!("../../../data/score.cfg");
 
@@ -17,15 +20,47 @@ fn main() {
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Project 1990".into(),
-                resolution: (960, 720).into(),
+                // Tall enough for HUD band + map at default size.
+                resolution: (1024, 800).into(),
                 ..default()
             }),
             ..default()
         }))
+        .init_state::<Screen>()
         .insert_resource(ClearColor(Color::srgb(0.08, 0.08, 0.1)))
+        .insert_resource(Paused(false))
+        .insert_resource(ShowControlsHelp(true))
+        .insert_resource(FrameInput::default())
+        .insert_resource(LevelSession { number: 1 })
         .add_systems(Startup, setup)
-        .add_systems(Update, (read_input, step_sim, sync_view).chain())
+        .add_systems(
+            Update,
+            (
+                menu_controls.run_if(in_state(Screen::Menu)),
+                stage_controls.run_if(in_state(Screen::LevelIntro)),
+                (playing_controls, step_sim, sync_play)
+                    .chain()
+                    .run_if(in_state(Screen::Playing)),
+                update_overlay_text,
+                set_playfield_visibility,
+            ),
+        )
         .run();
+}
+
+#[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
+enum Screen {
+    #[default]
+    Menu,
+    /// Classic-style “STAGE N” card before the fight.
+    LevelIntro,
+    Playing,
+}
+
+/// Which campaign stage is loaded (1…100 later).
+#[derive(Resource, Clone, Copy)]
+struct LevelSession {
+    number: u32,
 }
 
 #[derive(Resource)]
@@ -35,10 +70,16 @@ struct SimWorld(World);
 struct FrameInput(SimInput);
 
 #[derive(Resource)]
+struct Paused(bool);
+
+#[derive(Resource)]
 struct ViewMeta {
     map_w: f32,
     map_h: f32,
 }
+
+#[derive(Component)]
+struct Playfield;
 
 #[derive(Component)]
 struct TileSprite {
@@ -59,7 +100,6 @@ struct BulletSprite {
 #[derive(Component)]
 struct HudLabel;
 
-/// When true, show the controls cheat-sheet under the status line.
 #[derive(Resource)]
 struct ShowControlsHelp(bool);
 
@@ -74,7 +114,6 @@ fn make_world() -> World {
                 max_on_field: 4,
                 spawn_interval: 2.0,
             },
-            // Lower threshold in playtest so +1 life is easy to see (prod default 20_000).
             lives: LivesConfig {
                 starting_lives: 3,
                 max_lives: 5,
@@ -94,17 +133,17 @@ fn setup(mut commands: Commands) {
 
     commands.spawn(Camera2d);
     commands.insert_resource(ViewMeta { map_w, map_h });
-    commands.insert_resource(FrameInput::default());
-    commands.insert_resource(ShowControlsHelp(true));
 
     for y in 0..world.map.height() {
         for x in 0..world.map.width() {
             let tile = world.map.get(x, y).unwrap();
             let (bx, by) = sim_to_bevy(x as f32 + 0.5, y as f32 + 0.5, map_w, map_h);
             commands.spawn((
+                Playfield,
                 TileSprite { x, y },
                 Sprite::from_color(tile_color(tile), Vec2::splat(TILE_PX - 1.0)),
                 Transform::from_xyz(bx, by, 0.0),
+                Visibility::Hidden,
             ));
         }
     }
@@ -113,15 +152,19 @@ fn setup(mut commands: Commands) {
         spawn_tank_sprite(&mut commands, tank.id, tank.team, tank.x, tank.y, map_w, map_h);
     }
 
+    // HUD sits in the band above the (down-shifted) playfield; TopCenter grows down into the band.
+    let map_top = map_h * TILE_PX * 0.5 - HUD_BAND_PX * 0.5;
     commands.spawn((
         HudLabel,
-        Text2d::new(hud_text(&world, true)),
+        Text2d::new(menu_text()),
         TextFont {
             font_size: FontSize::Px(16.0),
             ..default()
         },
-        TextColor(Color::srgb(0.9, 0.9, 0.85)),
-        Transform::from_xyz(0.0, map_h * TILE_PX * 0.5 + 36.0, 2.0),
+        TextColor(Color::srgb(0.95, 0.95, 0.88)),
+        TextLayout::justify(Justify::Center),
+        Anchor::TOP_CENTER,
+        Transform::from_xyz(0.0, map_top + HUD_BAND_PX - 4.0, 2.0),
     ));
 
     commands.insert_resource(SimWorld(world));
@@ -138,23 +181,103 @@ fn spawn_tank_sprite(
 ) {
     let (bx, by) = sim_to_bevy(x, y, map_w, map_h);
     commands.spawn((
+        Playfield,
         TankSprite { sim_id },
         Sprite::from_color(team_color(team), Vec2::splat(TILE_PX * 0.8)),
         Transform::from_xyz(bx, by, 1.0),
+        Visibility::Hidden,
     ));
 }
 
-fn read_input(
+fn begin_level(
+    sim: &mut SimWorld,
+    session: &mut LevelSession,
+    paused: &mut Paused,
+    level: u32,
+) {
+    session.number = level;
+    *sim = SimWorld(make_world());
+    paused.0 = false;
+}
+
+fn menu_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut next: ResMut<NextState<Screen>>,
+    mut paused: ResMut<Paused>,
+    mut sim: ResMut<SimWorld>,
+    mut session: ResMut<LevelSession>,
+) {
+    if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
+        begin_level(&mut sim, &mut session, &mut paused, 1);
+        next.set(Screen::LevelIntro);
+    }
+}
+
+fn stage_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut next: ResMut<NextState<Screen>>,
+    mut paused: ResMut<Paused>,
+) {
+    if keys.just_pressed(KeyCode::Escape) {
+        paused.0 = false;
+        next.set(Screen::Menu);
+        return;
+    }
+    if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
+        paused.0 = false;
+        next.set(Screen::Playing);
+    }
+}
+
+fn playing_controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut frame: ResMut<FrameInput>,
     mut help: ResMut<ShowControlsHelp>,
+    mut paused: ResMut<Paused>,
+    mut next: ResMut<NextState<Screen>>,
     mut sim: ResMut<SimWorld>,
+    mut session: ResMut<LevelSession>,
 ) {
+    let round_over = sim.0.outcome != RoundOutcome::Playing;
+
     if keys.just_pressed(KeyCode::KeyH) {
         help.0 = !help.0;
     }
-    if keys.just_pressed(KeyCode::KeyR) {
-        *sim = SimWorld(make_world());
+
+    // Esc / P: pause while playing; from pause or round-over → main menu.
+    if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::KeyP) {
+        if round_over {
+            next.set(Screen::Menu);
+            paused.0 = false;
+            return;
+        }
+        if paused.0 {
+            // Esc from pause → menu; P only resumes.
+            if keys.just_pressed(KeyCode::Escape) {
+                next.set(Screen::Menu);
+                paused.0 = false;
+            } else {
+                paused.0 = false;
+            }
+        } else {
+            paused.0 = true;
+        }
+        return;
+    }
+
+    if round_over {
+        if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
+            let n = session.number;
+            begin_level(&mut sim, &mut session, &mut paused, n);
+            next.set(Screen::LevelIntro);
+        }
+        frame.0 = SimInput::default();
+        return;
+    }
+
+    if paused.0 {
+        frame.0 = SimInput::default();
+        return;
     }
 
     let move_dir = if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) {
@@ -177,12 +300,48 @@ fn read_input(
     };
 }
 
-fn step_sim(mut sim: ResMut<SimWorld>, frame: Res<FrameInput>) {
+fn step_sim(mut sim: ResMut<SimWorld>, frame: Res<FrameInput>, paused: Res<Paused>) {
+    if paused.0 {
+        return;
+    }
     let dt = 1.0 / DEFAULT_TICK_HZ as f32;
     sim.0.step(&frame.0, dt);
 }
 
-fn sync_view(
+fn update_overlay_text(
+    screen: Res<State<Screen>>,
+    sim: Res<SimWorld>,
+    session: Res<LevelSession>,
+    paused: Res<Paused>,
+    help: Res<ShowControlsHelp>,
+    mut label: Query<&mut Text2d, With<HudLabel>>,
+) {
+    let Ok(mut text) = label.single_mut() else {
+        return;
+    };
+    text.0 = match screen.get() {
+        Screen::Menu => menu_text(),
+        Screen::LevelIntro => stage_text(&sim.0, session.number),
+        Screen::Playing => hud_text(&sim.0, help.0, paused.0, session.number),
+    };
+}
+
+fn set_playfield_visibility(
+    screen: Res<State<Screen>>,
+    mut q: Query<&mut Visibility, With<Playfield>>,
+) {
+    let visible = matches!(screen.get(), Screen::Playing);
+    let vis = if visible {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for mut v in &mut q {
+        *v = vis;
+    }
+}
+
+fn sync_play(
     sim: Res<SimWorld>,
     meta: Res<ViewMeta>,
     mut tiles: Query<(&TileSprite, &mut Sprite), (With<TileSprite>, Without<TankSprite>)>,
@@ -194,18 +353,12 @@ fn sync_view(
         (Entity, &BulletSprite, &mut Transform),
         (With<BulletSprite>, Without<TankSprite>, Without<TileSprite>),
     >,
-    mut label: Query<&mut Text2d, With<HudLabel>>,
-    help: Res<ShowControlsHelp>,
     mut commands: Commands,
 ) {
     for (marker, mut sprite) in &mut tiles {
         if let Some(tile) = sim.0.map.get(marker.x, marker.y) {
             sprite.color = tile_color(tile);
         }
-    }
-
-    if let Ok(mut text) = label.single_mut() {
-        text.0 = hud_text(&sim.0, help.0);
     }
 
     let invuln = sim.0.progress.is_invulnerable();
@@ -278,25 +431,47 @@ fn sync_view(
     for (id, bx, by) in live_bullets {
         if !seen_bullets.contains(&id) {
             commands.spawn((
+                Playfield,
                 BulletSprite { sim_id: id },
                 Sprite::from_color(Color::srgb(1.0, 0.95, 0.4), Vec2::splat(8.0)),
                 Transform::from_xyz(bx, by, 1.5),
+                Visibility::Visible,
             ));
         }
     }
 }
 
-fn hud_text(world: &World, show_help: bool) -> String {
+fn menu_text() -> String {
+    "PROJECT 1990\n\nEnter / Space - play\n\nEsc/P pause | K autofire | H help\n(Classic title screen - later polish)"
+        .to_string()
+}
+
+fn stage_text(world: &World, level: u32) -> String {
+    let enemies = world.wave.config.total_enemies;
+    let lives = world.progress.lives;
+    let score = world.progress.score;
+    let max_on = world.wave.config.max_on_field;
+    format!(
+        "STAGE {level:02}\n\n\
+Lives {lives}    Score {score}\n\
+Enemies in wave {enemies}    On field max {max_on}\n\
+Goal: destroy all enemies - protect the base\n\n\
+Enter / Space - fight\n\
+Esc - menu"
+    )
+}
+
+fn hud_text(world: &World, show_help: bool, paused: bool, level: u32) -> String {
     let on = world.enemies_on_field();
     let max = world.wave.config.max_on_field;
     let left = world.wave.remaining_in_wave(on);
     let lives = world.progress.lives;
     let score = world.progress.score;
     let streak = world.style.streak;
-    let auto = world
+    let autofire = world
         .player()
-        .map(|p| if p.fire.autofire { "ON" } else { "off" })
-        .unwrap_or("off");
+        .map(|p| if p.fire.autofire { "ON" } else { "OFF" })
+        .unwrap_or("OFF");
     let popup = world
         .style
         .last_popup
@@ -304,10 +479,20 @@ fn hud_text(world: &World, show_help: bool) -> String {
         .map(|p| p.label())
         .unwrap_or_default();
 
+    if paused {
+        let mut t = format!(
+            "PAUSED  |  STAGE {level:02}\nSCORE {score}   lives {lives}   AUTOFIRE {autofire}\nP resume   Esc menu"
+        );
+        if show_help {
+            t.push_str("\nWASD move  Space/J fire  K autofire  H help");
+        }
+        return t;
+    }
+
     let status = match world.outcome {
         RoundOutcome::Playing => {
             let mut line = format!(
-                "SCORE {score}   lives {lives}   streak x{streak}   enemies {on}/{max} left {left}   autofire {auto}"
+                "STAGE {level:02}  SCORE {score}  lives {lives}  streak x{streak}  enemies {on}/{max} left {left}  AUTO {autofire}"
             );
             if !popup.is_empty() {
                 line.push_str(&format!("\n{popup}"));
@@ -315,29 +500,39 @@ fn hud_text(world: &World, show_help: bool) -> String {
             line
         }
         RoundOutcome::Victory => {
-            let mut line = format!("VICTORY — SCORE {score}  |  R restart");
+            let mut line =
+                format!("VICTORY - STAGE {level:02}  SCORE {score}\nEnter/Space next try   Esc menu");
             if !popup.is_empty() {
                 line.push_str(&format!("\n{popup}"));
             }
             line
         }
         RoundOutcome::DefeatBaseDestroyed => {
-            format!("DEFEAT — base destroyed  |  SCORE {score}  |  R restart")
+            format!(
+                "DEFEAT - base destroyed  |  STAGE {level:02}  SCORE {score}\nEnter/Space retry   Esc menu"
+            )
         }
         RoundOutcome::DefeatNoLives => {
-            format!("DEFEAT — no lives  |  SCORE {score}  |  R restart")
+            format!(
+                "DEFEAT - no lives  |  STAGE {level:02}  SCORE {score}\nEnter/Space retry   Esc menu"
+            )
         }
     };
+
+    if world.outcome != RoundOutcome::Playing {
+        return status;
+    }
     if show_help {
-        format!("{status}\nWASD move  Space/J fire  K autofire  H hide help  R restart")
+        format!("{status}\nWASD move  Space/J fire  K autofire  Esc/P pause  H hide help")
     } else {
-        format!("{status}   |   H show help")
+        format!("{status}\nH help")
     }
 }
 
 fn sim_to_bevy(sim_x: f32, sim_y: f32, map_w: f32, map_h: f32) -> (f32, f32) {
     let bx = (sim_x - map_w * 0.5) * TILE_PX;
-    let by = (map_h * 0.5 - sim_y) * TILE_PX;
+    // Shift playfield down so the HUD band above the map stays clear.
+    let by = (map_h * 0.5 - sim_y) * TILE_PX - HUD_BAND_PX * 0.5;
     (bx, by)
 }
 
