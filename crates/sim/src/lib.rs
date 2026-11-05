@@ -2,6 +2,7 @@
 //!
 //! No GPU/window dependencies — unit-testable and ready for a future dedicated server.
 
+mod bonus;
 mod fire;
 mod level;
 mod lives;
@@ -12,6 +13,11 @@ mod tile;
 mod wave;
 mod world;
 
+pub use bonus::{
+    bullet_speed_for_upgrade, fire_for_upgrade, upgrade_breaks_steel, upgrade_clears_forest,
+    ActiveBonus, BonusCatalog, BonusDef, BonusParseError, BonusPickup, BonusState, CancelFlags,
+    EffectKind, PickupWho, TankMods,
+};
 pub use fire::{FireConfig, FireController};
 pub use level::{embedded_map, Campaign, LevelDef, LevelError, LEVEL_COUNT};
 pub use lives::{LivesConfig, PlayerProgress};

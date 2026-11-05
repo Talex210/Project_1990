@@ -12,7 +12,8 @@ pub struct FireConfig {
 impl Default for FireConfig {
     fn default() -> Self {
         Self {
-            fire_interval: 0.35,
+            // Base cadence without stars (phase 3 balance).
+            fire_interval: 0.55,
             max_bullets: 1,
         }
     }

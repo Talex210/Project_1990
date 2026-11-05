@@ -162,6 +162,7 @@ fn gate_defeat_when_lives_exhausted() {
         x: px,
         y: py,
         dir: Dir::Down,
+        speed: 6.0,
     });
     world.step(&SimInput::default(), 1.0 / 60.0);
     assert_eq!(world.outcome, RoundOutcome::DefeatNoLives);

@@ -5,16 +5,17 @@
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use project1990_sim::{
-    default_save_path, Campaign, Dir, LEVEL_COUNT, LivesConfig, MAX_NAME_CHARS, MAX_PROFILES,
-    PlayerProgress, ProfileError, RoundOutcome, SaveData, ScoreConfig, SimConfig, SimInput, Team,
-    Tile, World, DEFAULT_TICK_HZ,
+    default_save_path, BonusCatalog, Campaign, Dir, LEVEL_COUNT, LivesConfig, MAX_NAME_CHARS,
+    MAX_PROFILES, PlayerProgress, ProfileError, RoundOutcome, SaveData, ScoreConfig, SimConfig,
+    SimInput, Team, Tile, World, DEFAULT_TICK_HZ,
 };
 use std::path::PathBuf;
 
 const TILE_PX: f32 = 32.0;
 /// Reserved space above the map so Playing HUD does not cover tiles.
-const HUD_BAND_PX: f32 = 100.0;
+const HUD_BAND_PX: f32 = 120.0;
 const SCORE_CFG: &str = include_str!("../../../data/score.cfg");
+const BONUS_CATALOG: &str = include_str!("../../../data/bonuses/catalog.cfg");
 
 fn main() {
     let campaign = Campaign::bundled().expect("data/levels/manifest.txt");
@@ -170,6 +171,17 @@ struct BulletSprite {
 }
 
 #[derive(Component)]
+struct BonusSprite {
+    sim_id: u64,
+}
+
+/// Letter drawn on top of the bonus square (same `sim_id`).
+#[derive(Component)]
+struct BonusLetter {
+    sim_id: u64,
+}
+
+#[derive(Component)]
 struct HudLabel;
 
 #[derive(Resource)]
@@ -180,6 +192,7 @@ fn make_world(levels: &Campaign, level: u32, carry: Option<PlayerProgress>) -> W
         .load(level)
         .unwrap_or_else(|e| panic!("load stage {level}: {e}"));
     let score = ScoreConfig::parse(SCORE_CFG).expect("data/score.cfg");
+    let bonuses = BonusCatalog::parse(BONUS_CATALOG).expect("data/bonuses/catalog.cfg");
     let mut world = World::new(
         map,
         SimConfig {
@@ -191,12 +204,15 @@ fn make_world(levels: &Campaign, level: u32, carry: Option<PlayerProgress>) -> W
                 invuln_secs: 3.0,
             },
             score,
+            bonuses,
             ..Default::default()
         },
     );
     if let Some(mut progress) = carry {
         progress.invuln_remaining = 0.0;
         world.progress = progress;
+        // Stars + ship persist across stages until death / bullet hit.
+        world.reapply_player_from_progress();
     }
     world
 }
@@ -650,7 +666,7 @@ fn update_overlay_text(
     menu_cursor: Res<MenuCursor>,
     draft: Res<NameDraft>,
     scores_ctx: Res<HighScoresCtx>,
-    mut label: Query<&mut Text2d, With<HudLabel>>,
+    mut label: Query<&mut Text2d, (With<HudLabel>, Without<BonusLetter>)>,
 ) {
     let Ok(mut text) = label.single_mut() else {
         return;
@@ -687,14 +703,55 @@ fn set_playfield_visibility(
 fn sync_play(
     sim: Res<SimWorld>,
     meta: Res<ViewMeta>,
-    mut tiles: Query<(&TileSprite, &mut Sprite), (With<TileSprite>, Without<TankSprite>)>,
+    mut tiles: Query<
+        (&TileSprite, &mut Sprite),
+        (
+            With<TileSprite>,
+            Without<TankSprite>,
+            Without<BonusSprite>,
+            Without<BonusLetter>,
+        ),
+    >,
     mut tanks: Query<
         (Entity, &TankSprite, &mut Transform, &mut Sprite),
-        (With<TankSprite>, Without<TileSprite>, Without<BulletSprite>),
+        (
+            With<TankSprite>,
+            Without<TileSprite>,
+            Without<BulletSprite>,
+            Without<BonusSprite>,
+            Without<BonusLetter>,
+        ),
     >,
     mut bullets: Query<
         (Entity, &BulletSprite, &mut Transform),
-        (With<BulletSprite>, Without<TankSprite>, Without<TileSprite>),
+        (
+            With<BulletSprite>,
+            Without<TankSprite>,
+            Without<TileSprite>,
+            Without<BonusSprite>,
+            Without<BonusLetter>,
+        ),
+    >,
+    mut bonuses: Query<
+        (Entity, &BonusSprite, &mut Transform, &mut Sprite),
+        (
+            With<BonusSprite>,
+            Without<TankSprite>,
+            Without<TileSprite>,
+            Without<BulletSprite>,
+            Without<BonusLetter>,
+        ),
+    >,
+    mut bonus_letters: Query<
+        (Entity, &BonusLetter, &mut Transform, &mut Text2d),
+        (
+            With<BonusLetter>,
+            Without<BonusSprite>,
+            Without<TankSprite>,
+            Without<BulletSprite>,
+            Without<TileSprite>,
+            Without<HudLabel>,
+        ),
     >,
     mut commands: Commands,
 ) {
@@ -704,7 +761,8 @@ fn sync_play(
         }
     }
 
-    let invuln = sim.0.progress.is_invulnerable();
+    let invuln = sim.0.progress.is_invulnerable()
+        || sim.0.player().map(|t| t.mods.invuln).unwrap_or(false);
     let blink_on = !invuln || ((sim.0.tick / 8) % 2 == 0);
 
     let live_tanks: Vec<(u64, Team, f32, f32, Dir)> = sim
@@ -778,6 +836,75 @@ fn sync_play(
                 BulletSprite { sim_id: id },
                 Sprite::from_color(Color::srgb(1.0, 0.95, 0.4), Vec2::splat(8.0)),
                 Transform::from_xyz(bx, by, 1.5),
+                Visibility::Visible,
+            ));
+        }
+    }
+
+    let live_bonuses: Vec<(u64, char, f32, f32)> = sim
+        .0
+        .bonuses
+        .pickups
+        .iter()
+        .map(|p| {
+            let (bx, by) = sim_to_bevy(p.x, p.y, meta.map_w, meta.map_h);
+            (p.id, p.letter, bx, by)
+        })
+        .collect();
+    let blink_bonus = (sim.0.tick / 12) % 2 == 0;
+
+    let mut seen_bonuses = Vec::new();
+    for (entity, marker, mut tf, mut sprite) in &mut bonuses {
+        if let Some((_, letter, bx, by)) =
+            live_bonuses.iter().find(|(id, _, _, _)| *id == marker.sim_id)
+        {
+            tf.translation.x = *bx;
+            tf.translation.y = *by;
+            sprite.color = if blink_bonus {
+                bonus_color(*letter)
+            } else {
+                Color::srgb(1.0, 1.0, 0.55)
+            };
+            seen_bonuses.push(marker.sim_id);
+        } else {
+            commands.entity(entity).despawn();
+        }
+    }
+    let mut seen_letters = Vec::new();
+    for (entity, marker, mut tf, mut text) in &mut bonus_letters {
+        if let Some((_, letter, bx, by)) =
+            live_bonuses.iter().find(|(id, _, _, _)| *id == marker.sim_id)
+        {
+            tf.translation.x = *bx;
+            tf.translation.y = *by;
+            text.0 = letter.to_string();
+            seen_letters.push(marker.sim_id);
+        } else {
+            commands.entity(entity).despawn();
+        }
+    }
+    for (id, letter, bx, by) in live_bonuses {
+        if !seen_bonuses.contains(&id) {
+            commands.spawn((
+                Playfield,
+                BonusSprite { sim_id: id },
+                Sprite::from_color(bonus_color(letter), Vec2::splat(TILE_PX * 0.78)),
+                Transform::from_xyz(bx, by, 1.7),
+                Visibility::Visible,
+            ));
+        }
+        if !seen_letters.contains(&id) {
+            commands.spawn((
+                Playfield,
+                BonusLetter { sim_id: id },
+                Text2d::new(letter.to_string()),
+                TextFont {
+                    font_size: FontSize::Px(22.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.08, 0.08, 0.1)),
+                TextLayout::justify(Justify::Center),
+                Transform::from_xyz(bx, by, 1.85),
                 Visibility::Visible,
             ));
         }
@@ -900,7 +1027,7 @@ fn hud_text(world: &World, show_help: bool, paused: bool, level: u32) -> String 
     let left = world.wave.remaining_in_wave(on);
     let lives = world.progress.lives;
     let score = world.progress.score;
-    let streak = world.style.streak;
+    let _streak = world.style.streak;
     let autofire = world
         .player()
         .map(|p| if p.fire.autofire { "ON" } else { "OFF" })
@@ -911,6 +1038,15 @@ fn hud_text(world: &World, show_help: bool, paused: bool, level: u32) -> String 
         .as_ref()
         .map(|p| p.label())
         .unwrap_or_default();
+    let upgrade = world.player().map(|p| p.mods.upgrade).unwrap_or(0);
+    let mut active = world
+        .bonuses
+        .hud_active_labels(Team::Player, world.player().map(|p| p.id));
+    active.extend(project1990_sim::BonusState::hud_power_labels(
+        upgrade,
+        world.progress.ship,
+    ));
+    let field = world.bonuses.hud_field_labels();
 
     if paused {
         let mut t = format!(
@@ -925,8 +1061,16 @@ fn hud_text(world: &World, show_help: bool, paused: bool, level: u32) -> String 
     let status = match world.outcome {
         RoundOutcome::Playing => {
             let mut line = format!(
-                "STAGE {level:02}  SCORE {score}  lives {lives}  streak x{streak}  enemies {on}/{max} left {left}  AUTO {autofire}"
+                "STAGE {level:02}  SCORE {score}  lives {lives}  tank★{upgrade}  enemies {on}/{max} left {left}  AUTO {autofire}"
             );
+            if !active.is_empty() {
+                line.push_str(&format!("\nACTIVE  {}", active.join("  |  ")));
+            } else {
+                line.push_str("\nACTIVE  (none)");
+            }
+            if !field.is_empty() {
+                line.push_str(&format!("\nON MAP  {}", field.join("  |  ")));
+            }
             if !popup.is_empty() {
                 line.push_str(&format!("\n{popup}"));
             }
@@ -996,5 +1140,20 @@ fn tile_color(tile: Tile) -> Color {
         Tile::Forest => Color::srgb(0.12, 0.45, 0.18),
         Tile::Ice => Color::srgb(0.7, 0.85, 0.95),
         Tile::Base => Color::srgb(0.9, 0.75, 0.2),
+    }
+}
+
+fn bonus_color(letter: char) -> Color {
+    match letter {
+        'H' => Color::srgb(0.95, 0.85, 0.2),
+        'C' => Color::srgb(0.4, 0.85, 1.0),
+        'L' => Color::srgb(0.7, 0.55, 0.3),
+        'G' => Color::srgb(0.9, 0.25, 0.2),
+        '*' => Color::srgb(1.0, 0.9, 0.35),
+        'P' => Color::srgb(0.95, 0.55, 0.15),
+        'T' => Color::srgb(0.35, 0.9, 0.45),
+        'B' => Color::srgb(0.25, 0.55, 0.95),
+        'F' => Color::srgb(0.2, 0.75, 0.35),
+        _ => Color::srgb(0.95, 0.95, 0.4),
     }
 }

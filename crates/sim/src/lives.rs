@@ -33,6 +33,10 @@ pub struct PlayerProgress {
     pub score_life_tiers_claimed: u32,
     /// Seconds of invulnerability left (`0` = vulnerable).
     pub invuln_remaining: f32,
+    /// Star / gun level carried across stages until death (0…4; ★4 = forest).
+    pub tank_upgrade: u8,
+    /// Ship carried across stages until hit by an enemy bullet (no timer).
+    pub ship: bool,
 }
 
 impl PlayerProgress {
@@ -42,8 +46,16 @@ impl PlayerProgress {
             score: 0,
             score_life_tiers_claimed: 0,
             invuln_remaining: 0.0,
+            tank_upgrade: 0,
+            ship: false,
             config,
         }
+    }
+
+    /// Stars / ship are lost on death.
+    pub fn reset_tank_power(&mut self) {
+        self.tank_upgrade = 0;
+        self.ship = false;
     }
 
     pub fn is_invulnerable(&self) -> bool {
@@ -95,6 +107,7 @@ impl PlayerProgress {
     /// Called when the active player tank is destroyed.
     /// Decrements life stock; returns `true` if a respawn should happen.
     pub fn on_tank_destroyed(&mut self) -> bool {
+        self.reset_tank_power();
         if self.lives == 0 {
             return false;
         }
