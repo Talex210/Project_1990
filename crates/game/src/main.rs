@@ -5,17 +5,17 @@
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use project1990_sim::{
-    Dir, LivesConfig, Map, RoundOutcome, ScoreConfig, SimConfig, SimInput, Team, Tile, WaveConfig,
-    World, DEFAULT_TICK_HZ,
+    Campaign, Dir, LEVEL_COUNT, LivesConfig, PlayerProgress, RoundOutcome, ScoreConfig, SimConfig,
+    SimInput, Team, Tile, World, DEFAULT_TICK_HZ,
 };
 
 const TILE_PX: f32 = 32.0;
 /// Reserved space above the map so Playing HUD does not cover tiles.
 const HUD_BAND_PX: f32 = 100.0;
-const MAP_TEXT: &str = include_str!("../../../data/maps/test_level.txt");
 const SCORE_CFG: &str = include_str!("../../../data/score.cfg");
 
 fn main() {
+    let campaign = Campaign::bundled().expect("data/levels/manifest.txt");
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -32,6 +32,7 @@ fn main() {
         .insert_resource(ShowControlsHelp(true))
         .insert_resource(FrameInput::default())
         .insert_resource(LevelSession { number: 1 })
+        .insert_resource(Levels(campaign))
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -57,11 +58,14 @@ enum Screen {
     Playing,
 }
 
-/// Which campaign stage is loaded (1…100 later).
+/// Which campaign stage is loaded (1…100).
 #[derive(Resource, Clone, Copy)]
 struct LevelSession {
     number: u32,
 }
+
+#[derive(Resource, Deref, DerefMut)]
+struct Levels(Campaign);
 
 #[derive(Resource)]
 struct SimWorld(World);
@@ -103,17 +107,15 @@ struct HudLabel;
 #[derive(Resource)]
 struct ShowControlsHelp(bool);
 
-fn make_world() -> World {
-    let map = Map::parse(MAP_TEXT).expect("test_level.txt must parse");
+fn make_world(levels: &Campaign, level: u32, carry: Option<PlayerProgress>) -> World {
+    let (map, wave) = levels
+        .load(level)
+        .unwrap_or_else(|e| panic!("load stage {level}: {e}"));
     let score = ScoreConfig::parse(SCORE_CFG).expect("data/score.cfg");
-    World::new(
+    let mut world = World::new(
         map,
         SimConfig {
-            wave: WaveConfig {
-                total_enemies: 4,
-                max_on_field: 4,
-                spawn_interval: 2.0,
-            },
+            wave,
             lives: LivesConfig {
                 starting_lives: 3,
                 max_lives: 5,
@@ -123,11 +125,16 @@ fn make_world() -> World {
             score,
             ..Default::default()
         },
-    )
+    );
+    if let Some(mut progress) = carry {
+        progress.invuln_remaining = 0.0;
+        world.progress = progress;
+    }
+    world
 }
 
-fn setup(mut commands: Commands) {
-    let world = make_world();
+fn setup(mut commands: Commands, levels: Res<Levels>) {
+    let world = make_world(&levels, 1, None);
     let map_w = world.map.width() as f32;
     let map_h = world.map.height() as f32;
 
@@ -193,10 +200,12 @@ fn begin_level(
     sim: &mut SimWorld,
     session: &mut LevelSession,
     paused: &mut Paused,
+    levels: &Campaign,
     level: u32,
+    carry: Option<PlayerProgress>,
 ) {
-    session.number = level;
-    *sim = SimWorld(make_world());
+    session.number = level.clamp(1, LEVEL_COUNT);
+    *sim = SimWorld(make_world(levels, session.number, carry));
     paused.0 = false;
 }
 
@@ -206,9 +215,10 @@ fn menu_controls(
     mut paused: ResMut<Paused>,
     mut sim: ResMut<SimWorld>,
     mut session: ResMut<LevelSession>,
+    levels: Res<Levels>,
 ) {
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
-        begin_level(&mut sim, &mut session, &mut paused, 1);
+        begin_level(&mut sim, &mut session, &mut paused, &levels, 1, None);
         next.set(Screen::LevelIntro);
     }
 }
@@ -237,6 +247,7 @@ fn playing_controls(
     mut next: ResMut<NextState<Screen>>,
     mut sim: ResMut<SimWorld>,
     mut session: ResMut<LevelSession>,
+    levels: Res<Levels>,
 ) {
     let round_over = sim.0.outcome != RoundOutcome::Playing;
 
@@ -268,7 +279,25 @@ fn playing_controls(
     if round_over {
         if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
             let n = session.number;
-            begin_level(&mut sim, &mut session, &mut paused, n);
+            match sim.0.outcome {
+                RoundOutcome::Victory => {
+                    let next_stage = (n + 1).min(LEVEL_COUNT);
+                    let carry = Some(sim.0.progress.clone());
+                    begin_level(
+                        &mut sim,
+                        &mut session,
+                        &mut paused,
+                        &levels,
+                        next_stage,
+                        carry,
+                    );
+                }
+                // Base gone or no lives → full run restart from STAGE 01.
+                RoundOutcome::DefeatBaseDestroyed | RoundOutcome::DefeatNoLives => {
+                    begin_level(&mut sim, &mut session, &mut paused, &levels, 1, None);
+                }
+                RoundOutcome::Playing => {}
+            }
             next.set(Screen::LevelIntro);
         }
         frame.0 = SimInput::default();
@@ -501,7 +530,9 @@ fn hud_text(world: &World, show_help: bool, paused: bool, level: u32) -> String 
         }
         RoundOutcome::Victory => {
             let mut line =
-                format!("VICTORY - STAGE {level:02}  SCORE {score}\nEnter/Space next try   Esc menu");
+                format!(
+                    "VICTORY - STAGE {level:02}  SCORE {score}\nEnter/Space next stage   Esc menu"
+                );
             if !popup.is_empty() {
                 line.push_str(&format!("\n{popup}"));
             }
@@ -509,12 +540,12 @@ fn hud_text(world: &World, show_help: bool, paused: bool, level: u32) -> String 
         }
         RoundOutcome::DefeatBaseDestroyed => {
             format!(
-                "DEFEAT - base destroyed  |  STAGE {level:02}  SCORE {score}\nEnter/Space retry   Esc menu"
+                "GAME OVER\nBase destroyed  |  STAGE {level:02}  SCORE {score}\nEnter/Space restart from STAGE 01   Esc menu"
             )
         }
         RoundOutcome::DefeatNoLives => {
             format!(
-                "DEFEAT - no lives  |  STAGE {level:02}  SCORE {score}\nEnter/Space retry   Esc menu"
+                "GAME OVER\nNo lives left  |  STAGE {level:02}  SCORE {score}\nEnter/Space restart from STAGE 01   Esc menu"
             )
         }
     };

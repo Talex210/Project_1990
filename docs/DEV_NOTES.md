@@ -6,7 +6,8 @@
 Cargo.toml                 # workspace
 crates/sim/                # project1990-sim — headless логика + тесты
 crates/game/               # project1990 — Bevy-окно, ввод, спрайты
-data/maps/test_level.txt   # текстовая карта (. # S ~ F I E P)
+data/maps/                 # level_001..003, placeholder, test_level (все 16×16)
+data/levels/manifest.txt   # 100 stages → map + wave params
 data/score.cfg             # таблица очков
 .github/workflows/ci.yml   # cargo test --workspace
 ```
@@ -21,6 +22,9 @@ data/score.cfg             # таблица очков
 - **Title screen «как на Dendy»** (арт, шрифт, анимация START) — отложен на полировку (фаза 6); функциональный каркас уже есть.
 - Перед каждым уровнем — STAGE-экран; на него же можно выводить подсказки/рекорды уровня позже.
 - Оверлей — `Text2d` + `Anchor::TOP_CENTER` в полосе `HUD_BAND_PX` над картой (playfield сдвинут вниз); окно 1024×800. Адаптивный Bevy UI / свои шрифты — фаза 6.
+- Кампания 1…100: `Campaign` в sim читает манифест; ранние карты уникальны, остальное — `placeholder.txt` + растущая волна. Уникальные раскладки — фаза 5.
+- **GAME OVER** (база или 0 жизней) → рестарт рана с STAGE 01.
+- **Отложено (2P / кооп):** игрок с 0 жизней по клавише старта может забрать 1 жизнь у второго игрока и снова выйти на поле (как в классике). Сейчас только соло — реализовать вместе с локальным P2 / ИИ-союзником.
 
 ## Чистый код: Rust + Bevy — так лучше для нас?
 

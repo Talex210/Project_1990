@@ -58,7 +58,8 @@ Workspace:
 |-------|------|
 | `crates/sim` (`project1990-sim`) | Чистая симуляция (тайлы, танк, пули, тесты) |
 | `crates/game` (`project1990`) | Bevy-клиент: окно, ввод, отрисовка |
-| `data/maps/test_level.txt` | Тестовая карта фазы 1 |
+| `data/levels/manifest.txt` | Кампания 1…100 (карта + волна) |
+| `data/maps/` | Карты уровней + `placeholder.txt` |
 
 ## Управление (v1)
 

@@ -3,6 +3,7 @@
 //! No GPU/window dependencies — unit-testable and ready for a future dedicated server.
 
 mod fire;
+mod level;
 mod lives;
 mod map;
 mod score;
@@ -11,6 +12,7 @@ mod wave;
 mod world;
 
 pub use fire::{FireConfig, FireController};
+pub use level::{embedded_map, Campaign, LevelDef, LevelError, LEVEL_COUNT};
 pub use lives::{LivesConfig, PlayerProgress};
 pub use map::{Map, MapError, SpawnPoint};
 pub use score::{EnemyKind, ScoreConfig, ScorePopup, StyleState};
