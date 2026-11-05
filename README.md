@@ -60,12 +60,15 @@ Workspace:
 | `crates/game` (`project1990`) | Bevy-клиент: окно, ввод, отрисовка |
 | `data/levels/manifest.txt` | Кампания 1…100 (карта + волна) |
 | `data/maps/` | Карты уровней + `placeholder.txt` |
+| `saves/save_v1.txt` | Локальные профили / рекорды (создаётся при игре) |
 
 ## Управление (v1)
 
 | Действие | Клавиши |
 |----------|---------|
-| Меню → STAGE → бой | Enter / Space |
+| Выбор / создание игрока | список + Create new; Up/Down, Enter |
+| Главное меню | Up/Down по строкам, Enter — выбор |
+| Solo-рекорды | пункт меню / после GAME OVER |
 | Движение | WASD / стрелки |
 | Огонь | Space / J (удержание = повтор с fire-rate) |
 | Автоогонь вкл/выкл | K / CapsLock |

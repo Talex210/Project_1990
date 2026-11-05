@@ -27,6 +27,9 @@ dist/
 .env
 .env.*
 
+# Local player saves (phase 2.7)
+/saves/
+
 # Python tooling (если появятся скрипты)
 __pycache__/
 .venv/

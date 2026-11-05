@@ -5,9 +5,11 @@
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use project1990_sim::{
-    Campaign, Dir, LEVEL_COUNT, LivesConfig, PlayerProgress, RoundOutcome, ScoreConfig, SimConfig,
-    SimInput, Team, Tile, World, DEFAULT_TICK_HZ,
+    default_save_path, Campaign, Dir, LEVEL_COUNT, LivesConfig, MAX_NAME_CHARS, MAX_PROFILES,
+    PlayerProgress, ProfileError, RoundOutcome, SaveData, ScoreConfig, SimConfig, SimInput, Team,
+    Tile, World, DEFAULT_TICK_HZ,
 };
+use std::path::PathBuf;
 
 const TILE_PX: f32 = 32.0;
 /// Reserved space above the map so Playing HUD does not cover tiles.
@@ -16,6 +18,15 @@ const SCORE_CFG: &str = include_str!("../../../data/score.cfg");
 
 fn main() {
     let campaign = Campaign::bundled().expect("data/levels/manifest.txt");
+    let save_path = default_save_path();
+    let save = SaveData::load_path(&save_path).unwrap_or_else(|e| {
+        eprintln!("save load failed ({e}); using defaults");
+        SaveData::default()
+    });
+    // Old schema-1 files are rejected — start clean named profiles.
+    let cursor = ProfileCursor {
+        index: save.active_profile.min(save.profiles.len().saturating_add(1).saturating_sub(1)),
+    };
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -33,17 +44,32 @@ fn main() {
         .insert_resource(FrameInput::default())
         .insert_resource(LevelSession { number: 1 })
         .insert_resource(Levels(campaign))
+        .insert_resource(SaveStore {
+            data: save,
+            path: save_path,
+        })
+        .insert_resource(cursor)
+        .insert_resource(MenuCursor { index: 0 })
+        .insert_resource(NameDraft::default())
+        .insert_resource(HighScoresCtx {
+            after_game_over: false,
+        })
         .add_systems(Startup, setup)
+        .add_systems(OnEnter(Screen::Menu), reset_menu_cursor)
         .add_systems(
             Update,
             (
+                profile_select_controls.run_if(in_state(Screen::ProfileSelect)),
+                profile_create_controls.run_if(in_state(Screen::ProfileCreate)),
                 menu_controls.run_if(in_state(Screen::Menu)),
+                high_scores_controls.run_if(in_state(Screen::HighScores)),
                 stage_controls.run_if(in_state(Screen::LevelIntro)),
                 (playing_controls, step_sim, sync_play)
                     .chain()
                     .run_if(in_state(Screen::Playing)),
                 update_overlay_text,
                 set_playfield_visibility,
+                save_on_app_exit,
             ),
         )
         .run();
@@ -52,10 +78,38 @@ fn main() {
 #[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
 enum Screen {
     #[default]
+    ProfileSelect,
+    ProfileCreate,
     Menu,
+    HighScores,
     /// Classic-style “STAGE N” card before the fight.
     LevelIntro,
     Playing,
+}
+
+/// Cursor on profile list; last index = “Create new”.
+#[derive(Resource, Clone, Copy)]
+struct ProfileCursor {
+    index: usize,
+}
+
+/// Cursor on main menu rows (Continue / New game / Records / Change player).
+#[derive(Resource, Clone, Copy)]
+struct MenuCursor {
+    index: usize,
+}
+
+const MENU_ITEMS: usize = 4;
+
+#[derive(Resource, Default)]
+struct NameDraft {
+    text: String,
+    error: Option<String>,
+}
+
+#[derive(Resource, Clone, Copy)]
+struct HighScoresCtx {
+    after_game_over: bool,
 }
 
 /// Which campaign stage is loaded (1…100).
@@ -66,6 +120,20 @@ struct LevelSession {
 
 #[derive(Resource, Deref, DerefMut)]
 struct Levels(Campaign);
+
+#[derive(Resource)]
+struct SaveStore {
+    data: SaveData,
+    path: PathBuf,
+}
+
+impl SaveStore {
+    fn persist(&self) {
+        if let Err(e) = self.data.save_path(&self.path) {
+            eprintln!("save write failed: {e}");
+        }
+    }
+}
 
 #[derive(Resource)]
 struct SimWorld(World);
@@ -133,7 +201,15 @@ fn make_world(levels: &Campaign, level: u32, carry: Option<PlayerProgress>) -> W
     world
 }
 
-fn setup(mut commands: Commands, levels: Res<Levels>) {
+fn setup(
+    mut commands: Commands,
+    levels: Res<Levels>,
+    save: Res<SaveStore>,
+    mut next: ResMut<NextState<Screen>>,
+) {
+    if !save.data.has_profiles() {
+        next.set(Screen::ProfileCreate);
+    }
     let world = make_world(&levels, 1, None);
     let map_w = world.map.width() as f32;
     let map_h = world.map.height() as f32;
@@ -163,7 +239,7 @@ fn setup(mut commands: Commands, levels: Res<Levels>) {
     let map_top = map_h * TILE_PX * 0.5 - HUD_BAND_PX * 0.5;
     commands.spawn((
         HudLabel,
-        Text2d::new(menu_text()),
+        Text2d::new("PROJECT 1990"),
         TextFont {
             font_size: FontSize::Px(16.0),
             ..default()
@@ -209,6 +285,155 @@ fn begin_level(
     paused.0 = false;
 }
 
+fn profile_list_len(save: &SaveData) -> usize {
+    // profiles + mandatory "Create new" row
+    save.profiles.len() + 1
+}
+
+fn profile_select_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut next: ResMut<NextState<Screen>>,
+    mut save: ResMut<SaveStore>,
+    mut cursor: ResMut<ProfileCursor>,
+    mut draft: ResMut<NameDraft>,
+) {
+    let len = profile_list_len(&save.data);
+    if len == 0 {
+        return;
+    }
+    cursor.index %= len;
+
+    if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW) {
+        cursor.index = if cursor.index == 0 { len - 1 } else { cursor.index - 1 };
+        return;
+    }
+    if keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS) {
+        cursor.index = (cursor.index + 1) % len;
+        return;
+    }
+    if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
+        if cursor.index >= save.data.profiles.len() {
+            *draft = NameDraft::default();
+            next.set(Screen::ProfileCreate);
+        } else {
+            save.data.select_profile(cursor.index);
+            save.persist();
+            next.set(Screen::Menu);
+        }
+    }
+}
+
+fn profile_create_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut next: ResMut<NextState<Screen>>,
+    mut save: ResMut<SaveStore>,
+    mut draft: ResMut<NameDraft>,
+    mut cursor: ResMut<ProfileCursor>,
+) {
+    if keys.just_pressed(KeyCode::Escape) && save.data.has_profiles() {
+        next.set(Screen::ProfileSelect);
+        return;
+    }
+
+    if keys.just_pressed(KeyCode::Backspace) {
+        draft.text.pop();
+        draft.error = None;
+        return;
+    }
+
+    type_into_name(&keys, &mut draft.text);
+
+    if keys.just_pressed(KeyCode::Enter) {
+        match save.data.create_profile(&draft.text) {
+            Ok(idx) => {
+                save.persist();
+                cursor.index = idx;
+                *draft = NameDraft::default();
+                next.set(Screen::Menu);
+            }
+            Err(e) => {
+                draft.error = Some(match e {
+                    ProfileError::EmptyName => "Enter a name".into(),
+                    ProfileError::NameTaken => "Name already taken".into(),
+                    ProfileError::NameTooLong => format!("Max {MAX_NAME_CHARS} characters"),
+                    ProfileError::ProfileLimit => format!("Max {MAX_PROFILES} profiles"),
+                    ProfileError::NoProfiles => "No profiles".into(),
+                });
+            }
+        }
+    }
+}
+
+fn type_into_name(keys: &ButtonInput<KeyCode>, text: &mut String) {
+    if text.chars().count() >= MAX_NAME_CHARS {
+        return;
+    }
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let letters = [
+        (KeyCode::KeyA, 'a'),
+        (KeyCode::KeyB, 'b'),
+        (KeyCode::KeyC, 'c'),
+        (KeyCode::KeyD, 'd'),
+        (KeyCode::KeyE, 'e'),
+        (KeyCode::KeyF, 'f'),
+        (KeyCode::KeyG, 'g'),
+        (KeyCode::KeyH, 'h'),
+        (KeyCode::KeyI, 'i'),
+        (KeyCode::KeyJ, 'j'),
+        (KeyCode::KeyK, 'k'),
+        (KeyCode::KeyL, 'l'),
+        (KeyCode::KeyM, 'm'),
+        (KeyCode::KeyN, 'n'),
+        (KeyCode::KeyO, 'o'),
+        (KeyCode::KeyP, 'p'),
+        (KeyCode::KeyQ, 'q'),
+        (KeyCode::KeyR, 'r'),
+        (KeyCode::KeyS, 's'),
+        (KeyCode::KeyT, 't'),
+        (KeyCode::KeyU, 'u'),
+        (KeyCode::KeyV, 'v'),
+        (KeyCode::KeyW, 'w'),
+        (KeyCode::KeyX, 'x'),
+        (KeyCode::KeyY, 'y'),
+        (KeyCode::KeyZ, 'z'),
+    ];
+    for (code, ch) in letters {
+        if keys.just_pressed(code) {
+            text.push(if shift {
+                ch.to_ascii_uppercase()
+            } else {
+                ch
+            });
+            return;
+        }
+    }
+    let digits = [
+        (KeyCode::Digit0, '0'),
+        (KeyCode::Digit1, '1'),
+        (KeyCode::Digit2, '2'),
+        (KeyCode::Digit3, '3'),
+        (KeyCode::Digit4, '4'),
+        (KeyCode::Digit5, '5'),
+        (KeyCode::Digit6, '6'),
+        (KeyCode::Digit7, '7'),
+        (KeyCode::Digit8, '8'),
+        (KeyCode::Digit9, '9'),
+    ];
+    for (code, ch) in digits {
+        if keys.just_pressed(code) {
+            text.push(ch);
+            return;
+        }
+    }
+    if keys.just_pressed(KeyCode::Space) && !text.is_empty() {
+        text.push(' ');
+    }
+}
+
+fn reset_menu_cursor(mut cursor: ResMut<MenuCursor>) {
+    cursor.index = 0;
+}
+
 fn menu_controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut next: ResMut<NextState<Screen>>,
@@ -216,10 +441,80 @@ fn menu_controls(
     mut sim: ResMut<SimWorld>,
     mut session: ResMut<LevelSession>,
     levels: Res<Levels>,
+    save: Res<SaveStore>,
+    mut scores_ctx: ResMut<HighScoresCtx>,
+    mut cursor: ResMut<MenuCursor>,
 ) {
+    if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW) {
+        cursor.index = if cursor.index == 0 {
+            MENU_ITEMS - 1
+        } else {
+            cursor.index - 1
+        };
+        return;
+    }
+    if keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS) {
+        cursor.index = (cursor.index + 1) % MENU_ITEMS;
+        return;
+    }
+    if !(keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space)) {
+        return;
+    }
+    match cursor.index {
+        0 => {
+            // Continue
+            let stage = save
+                .data
+                .active()
+                .map(|p| p.continue_stage)
+                .unwrap_or(1);
+            begin_level(&mut sim, &mut session, &mut paused, &levels, stage, None);
+            next.set(Screen::LevelIntro);
+        }
+        1 => {
+            // New game
+            begin_level(&mut sim, &mut session, &mut paused, &levels, 1, None);
+            next.set(Screen::LevelIntro);
+        }
+        2 => {
+            scores_ctx.after_game_over = false;
+            next.set(Screen::HighScores);
+        }
+        3 => next.set(Screen::ProfileSelect),
+        _ => {}
+    }
+}
+
+fn save_on_app_exit(mut exits: MessageReader<AppExit>, save: Res<SaveStore>) {
+    if exits.read().next().is_some() {
+        save.persist();
+    }
+}
+
+fn high_scores_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut next: ResMut<NextState<Screen>>,
+    mut paused: ResMut<Paused>,
+    mut sim: ResMut<SimWorld>,
+    mut session: ResMut<LevelSession>,
+    levels: Res<Levels>,
+    scores_ctx: Res<HighScoresCtx>,
+) {
+    if keys.just_pressed(KeyCode::Escape) {
+        next.set(if scores_ctx.after_game_over {
+            Screen::Menu
+        } else {
+            Screen::Menu
+        });
+        return;
+    }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
-        begin_level(&mut sim, &mut session, &mut paused, &levels, 1, None);
-        next.set(Screen::LevelIntro);
+        if scores_ctx.after_game_over {
+            begin_level(&mut sim, &mut session, &mut paused, &levels, 1, None);
+            next.set(Screen::LevelIntro);
+        } else {
+            next.set(Screen::Menu);
+        }
     }
 }
 
@@ -248,6 +543,8 @@ fn playing_controls(
     mut sim: ResMut<SimWorld>,
     mut session: ResMut<LevelSession>,
     levels: Res<Levels>,
+    mut save: ResMut<SaveStore>,
+    mut scores_ctx: ResMut<HighScoresCtx>,
 ) {
     let round_over = sim.0.outcome != RoundOutcome::Playing;
 
@@ -279,8 +576,11 @@ fn playing_controls(
     if round_over {
         if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
             let n = session.number;
+            let score = sim.0.progress.score;
             match sim.0.outcome {
                 RoundOutcome::Victory => {
+                    save.data.record_run_end(score, n, true);
+                    save.persist();
                     let next_stage = (n + 1).min(LEVEL_COUNT);
                     let carry = Some(sim.0.progress.clone());
                     begin_level(
@@ -291,14 +591,16 @@ fn playing_controls(
                         next_stage,
                         carry,
                     );
+                    next.set(Screen::LevelIntro);
                 }
-                // Base gone or no lives → full run restart from STAGE 01.
                 RoundOutcome::DefeatBaseDestroyed | RoundOutcome::DefeatNoLives => {
-                    begin_level(&mut sim, &mut session, &mut paused, &levels, 1, None);
+                    save.data.record_run_end(score, n, false);
+                    save.persist();
+                    scores_ctx.after_game_over = true;
+                    next.set(Screen::HighScores);
                 }
                 RoundOutcome::Playing => {}
             }
-            next.set(Screen::LevelIntro);
         }
         frame.0 = SimInput::default();
         return;
@@ -343,14 +645,26 @@ fn update_overlay_text(
     session: Res<LevelSession>,
     paused: Res<Paused>,
     help: Res<ShowControlsHelp>,
+    save: Res<SaveStore>,
+    profile_cursor: Res<ProfileCursor>,
+    menu_cursor: Res<MenuCursor>,
+    draft: Res<NameDraft>,
+    scores_ctx: Res<HighScoresCtx>,
     mut label: Query<&mut Text2d, With<HudLabel>>,
 ) {
     let Ok(mut text) = label.single_mut() else {
         return;
     };
     text.0 = match screen.get() {
-        Screen::Menu => menu_text(),
-        Screen::LevelIntro => stage_text(&sim.0, session.number),
+        Screen::ProfileSelect => profile_select_text(&save.data, profile_cursor.index),
+        Screen::ProfileCreate => profile_create_text(&draft),
+        Screen::Menu => menu_text(&save.data, menu_cursor.index),
+        Screen::HighScores => high_scores_text(&save.data, scores_ctx.after_game_over),
+        Screen::LevelIntro => stage_text(
+            &sim.0,
+            session.number,
+            save.data.active().map(|p| p.name.as_str()),
+        ),
         Screen::Playing => hud_text(&sim.0, help.0, paused.0, session.number),
     };
 }
@@ -470,18 +784,108 @@ fn sync_play(
     }
 }
 
-fn menu_text() -> String {
-    "PROJECT 1990\n\nEnter / Space - play\n\nEsc/P pause | K autofire | H help\n(Classic title screen - later polish)"
-        .to_string()
+fn profile_select_text(save: &SaveData, cursor: usize) -> String {
+    let mut lines = String::from("SELECT PLAYER\n\n");
+    if save.profiles.is_empty() {
+        lines.push_str("(no profiles yet)\n");
+    }
+    for (i, p) in save.profiles.iter().enumerate() {
+        let mark = if i == cursor { ">" } else { " " };
+        lines.push_str(&format!(
+            "{mark} {}  best {}  cont {:02}\n",
+            p.name, p.best_run_score, p.continue_stage
+        ));
+    }
+    let create_idx = save.profiles.len();
+    let mark = if cursor == create_idx { ">" } else { " " };
+    let create_label = if save.profiles.len() >= MAX_PROFILES {
+        "Create new (full)"
+    } else {
+        "Create new profile"
+    };
+    lines.push_str(&format!("\n{mark} {create_label}\n"));
+    lines.push_str("\nUp/Down select   Enter confirm");
+    lines
 }
 
-fn stage_text(world: &World, level: u32) -> String {
+fn profile_create_text(draft: &NameDraft) -> String {
+    let mut lines = format!(
+        "NEW PROFILE\n\nName: {}_\n(max {MAX_NAME_CHARS} chars, unique)\n",
+        draft.text
+    );
+    if let Some(err) = &draft.error {
+        lines.push_str(&format!("\n! {err}\n"));
+    }
+    lines.push_str("\nType name   Enter create");
+    if draft.text.is_empty() {
+        // Esc only if profiles already exist — still show hint softly
+        lines.push_str("\nEsc cancel (if profiles exist)");
+    } else {
+        lines.push_str("\nBackspace delete   Esc cancel");
+    }
+    lines
+}
+
+fn menu_text(save: &SaveData, cursor: usize) -> String {
+    let Some(p) = save.active() else {
+        return "PROJECT 1990\n\nNo profile — use Change player".into();
+    };
+    let rows = [
+        format!("Continue  (STAGE {:02})", p.continue_stage),
+        "New game  (STAGE 01)".into(),
+        "Solo records".into(),
+        "Change player".into(),
+    ];
+    let mut lines = format!(
+        "PROJECT 1990\n\n\
+Player: {}   Personal best {}\n\
+Cleared {:02}   Reached {:02}\n\n",
+        p.name, p.best_run_score, p.highest_stage_cleared, p.highest_stage_reached
+    );
+    for (i, row) in rows.iter().enumerate() {
+        let mark = if i == cursor { ">" } else { " " };
+        lines.push_str(&format!("{mark} {row}\n"));
+    }
+    lines.push_str("\nUp/Down move   Enter select");
+    lines
+}
+
+fn high_scores_text(save: &SaveData, after_game_over: bool) -> String {
+    let mut lines = if after_game_over {
+        String::from("GAME OVER\n\nSOLO RECORDS\n")
+    } else {
+        String::from("SOLO RECORDS\n")
+    };
+    lines.push_str("(Coop table — later)\n\n");
+    if save.solo_board.is_empty() {
+        lines.push_str("  (empty)\n");
+    } else {
+        for (i, e) in save.solo_board.iter().enumerate() {
+            lines.push_str(&format!(
+                "  {:2}. {:12}  {:>6}  STAGE {:02}\n",
+                i + 1,
+                e.name,
+                e.score,
+                e.stage
+            ));
+        }
+    }
+    if after_game_over {
+        lines.push_str("\nEnter/Space restart STAGE 01   Esc menu");
+    } else {
+        lines.push_str("\nEnter/Esc back to menu");
+    }
+    lines
+}
+
+fn stage_text(world: &World, level: u32, player: Option<&str>) -> String {
     let enemies = world.wave.config.total_enemies;
     let lives = world.progress.lives;
     let score = world.progress.score;
     let max_on = world.wave.config.max_on_field;
+    let who = player.unwrap_or("Player");
     format!(
-        "STAGE {level:02}\n\n\
+        "STAGE {level:02}\n{who}\n\n\
 Lives {lives}    Score {score}\n\
 Enemies in wave {enemies}    On field max {max_on}\n\
 Goal: destroy all enemies - protect the base\n\n\
@@ -540,12 +944,12 @@ fn hud_text(world: &World, show_help: bool, paused: bool, level: u32) -> String 
         }
         RoundOutcome::DefeatBaseDestroyed => {
             format!(
-                "GAME OVER\nBase destroyed  |  STAGE {level:02}  SCORE {score}\nEnter/Space restart from STAGE 01   Esc menu"
+                "GAME OVER\nBase destroyed  |  STAGE {level:02}  SCORE {score}\nEnter/Space records   Esc menu"
             )
         }
         RoundOutcome::DefeatNoLives => {
             format!(
-                "GAME OVER\nNo lives left  |  STAGE {level:02}  SCORE {score}\nEnter/Space restart from STAGE 01   Esc menu"
+                "GAME OVER\nNo lives left  |  STAGE {level:02}  SCORE {score}\nEnter/Space records   Esc menu"
             )
         }
     };
