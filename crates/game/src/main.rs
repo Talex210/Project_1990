@@ -763,19 +763,33 @@ fn sync_play(
 
     let invuln = sim.0.progress.is_invulnerable()
         || sim.0.player().map(|t| t.mods.invuln).unwrap_or(false);
-    let blink_on = !invuln || ((sim.0.tick / 8) % 2 == 0);
 
-    let live_tanks: Vec<(u64, Team, f32, f32, Dir)> = sim
+    // Tank blink (carrier / armor / invuln flicker) deferred — solid tints for now.
+    let live_tanks: Vec<(u64, Team, f32, f32, Dir, u8, bool, bool, bool, bool)> = sim
         .0
         .tanks
         .iter()
-        .map(|t| (t.id, t.team, t.x, t.y, t.dir))
+        .map(|t| {
+            (
+                t.id,
+                t.team,
+                t.x,
+                t.y,
+                t.dir,
+                t.mods.upgrade,
+                t.mods.armored,
+                t.mods.water_walk,
+                t.carries_bonus,
+                t.mods.invuln,
+            )
+        })
         .collect();
 
     let mut seen_tanks = Vec::new();
     for (entity, marker, mut tf, mut sprite) in &mut tanks {
-        if let Some((_, team, x, y, dir)) =
-            live_tanks.iter().find(|(id, _, _, _, _)| *id == marker.sim_id)
+        if let Some((_, team, x, y, dir, upgrade, armored, ship, carries, _inv)) = live_tanks
+            .iter()
+            .find(|(id, _, _, _, _, _, _, _, _, _)| *id == marker.sim_id)
         {
             let (bx, by) = sim_to_bevy(*x, *y, meta.map_w, meta.map_h);
             tf.translation.x = bx;
@@ -783,11 +797,17 @@ fn sync_play(
             tf.rotation = Quat::from_rotation_z(dir_angle(*dir));
             let mut color = team_color(*team);
             if *team == Team::Player && invuln {
-                color = if blink_on {
-                    Color::srgb(0.85, 1.0, 0.9)
-                } else {
-                    Color::srgba(0.2, 0.85, 0.35, 0.25)
-                };
+                color = Color::srgb(0.85, 1.0, 0.9);
+            } else if *team == Team::Enemy {
+                if *carries {
+                    color = Color::srgb(0.95, 0.9, 0.85);
+                } else if *armored {
+                    color = Color::srgb(1.0, 0.85, 0.2);
+                } else if *upgrade > 0 {
+                    color = Color::srgb(0.95, 0.55, 0.15);
+                } else if *ship {
+                    color = Color::srgb(0.25, 0.65, 0.95);
+                }
             }
             sprite.color = color;
             seen_tanks.push(marker.sim_id);
@@ -795,7 +815,7 @@ fn sync_play(
             commands.entity(entity).despawn();
         }
     }
-    for (id, team, x, y, _) in &live_tanks {
+    for (id, team, x, y, _, _, _, _, _, _) in &live_tanks {
         if !seen_tanks.contains(id) {
             spawn_tank_sprite(
                 &mut commands,
@@ -1070,6 +1090,10 @@ fn hud_text(world: &World, show_help: bool, paused: bool, level: u32) -> String 
             }
             if !field.is_empty() {
                 line.push_str(&format!("\nON MAP  {}", field.join("  |  ")));
+            }
+            let enemy_pow = world.enemy_power_labels();
+            if !enemy_pow.is_empty() {
+                line.push_str(&format!("\nENEMY   {}", enemy_pow.join("  |  ")));
             }
             if !popup.is_empty() {
                 line.push_str(&format!("\n{popup}"));

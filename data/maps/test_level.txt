@@ -1,6 +1,5 @@
-// Phase 2.1 — X enemy spawn, P player. Center lane open so you can shoot top spawns.
-// . empty  # brick  S steel  ~ water  F forest  I ice  E base
-// 16x16 — all campaign maps share this size until playfield rebuild exists.
+// Test map — HQ classic bottom + steel fort (test). Same 16x16 as campaign.
+// . empty  # brick  S steel  ~ water  F forest  I ice  E base  P player  X enemy
 ################
 #X.....X.....X.#
 #.##.S#..#S.##.#
@@ -9,11 +8,11 @@
 #..............#
 #..IIII........#
 #..............#
+#..............#
+#..............#
+#..............#
+#..............#
 #......P.......#
-#..............#
-#......S.......#
-#......E.......#
-#.####....####.#
-#..............#
-#..............#
+#......SSS.....#
+#......SES.....#
 ################

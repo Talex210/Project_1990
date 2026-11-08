@@ -1,5 +1,7 @@
 //! Fixed-tick world: tanks, bullets, tile collisions.
 
+use std::collections::VecDeque;
+
 use crate::bonus::{
     bullet_speed_for_upgrade, fire_for_upgrade, upgrade_breaks_steel, upgrade_clears_forest,
     ActiveBonus, BonusCatalog, BonusPickup, BonusState, EffectKind, TankMods,
@@ -54,6 +56,8 @@ pub struct Tank {
     pub move_dir: Option<Dir>,
     /// Star / ship / helmet / forest flags from bonuses.
     pub mods: TankMods,
+    /// Classic flashing carrier: killing this tank drops a letter.
+    pub carries_bonus: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -209,7 +213,9 @@ impl World {
                 forest_clear: upgrade_clears_forest(upgrade),
                 water_walk: self.progress.ship,
                 invuln: false,
+                armored: false,
             },
+            carries_bonus: false,
         });
     }
 
@@ -219,6 +225,48 @@ impl World {
         self.tanks.retain(|t| t.id != pid);
         self.bullets.retain(|b| b.owner_id != pid);
         self.spawn_player_tank();
+    }
+
+    /// Readable enemy power for HUD (phase 3.2).
+    pub fn enemy_power_labels(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for t in self.tanks.iter().filter(|t| t.team == Team::Enemy) {
+            let mut parts = Vec::new();
+            if t.carries_bonus {
+                parts.push("DROP".into());
+            }
+            if t.mods.upgrade > 0 {
+                parts.push(format!("★{}", t.mods.upgrade));
+            }
+            if t.mods.armored {
+                parts.push("H".into());
+            }
+            if t.mods.invuln {
+                parts.push("H!".into());
+            }
+            if t.mods.water_walk {
+                parts.push("B".into());
+            }
+            let timed = self.bonuses.hud_active_labels(Team::Enemy, Some(t.id));
+            for label in timed {
+                if let Some(c) = label.chars().next() {
+                    let s = c.to_string();
+                    if !parts.iter().any(|p| p.starts_with(&s)) {
+                        parts.push(s);
+                    }
+                }
+            }
+            if !parts.is_empty() {
+                out.push(format!("E{}:{}", t.id, parts.join("")));
+            }
+        }
+        if self.bonuses.freeze_player_secs > 0.0 {
+            out.push(format!(
+                "frozen {:.0}s (can shoot)",
+                self.bonuses.freeze_player_secs.ceil()
+            ));
+        }
+        out
     }
 
     /// Spawn a pickup by catalog id at tile center (tests / debug).
@@ -282,20 +330,24 @@ impl World {
 
         let player_frozen = self.bonuses.opponents_frozen(Team::Player);
         if let Some(player) = self.player_mut() {
+            // Frozen: can shoot & turn in place? Classic: shoot yes, move no.
+            // Keep facing from last move; still accept fire / autofire.
             if player_frozen {
                 player.move_dir = None;
-                player.fire.set_fire_held(false);
             } else {
                 player.move_dir = input.move_dir;
                 if let Some(dir) = input.move_dir {
                     player.dir = dir;
                 }
-                player.fire.set_fire_held(input.fire_held);
-                if input.toggle_autofire {
-                    player.fire.toggle_autofire();
-                }
+            }
+            player.fire.set_fire_held(input.fire_held);
+            if input.toggle_autofire {
+                player.fire.toggle_autofire();
             }
         }
+
+        // Phase 3.2: enemies seek letter pickups (full AI is phase 4).
+        self.update_enemy_bonus_seek();
 
         self.move_tanks(dt);
         self.fire_weapons(dt);
@@ -354,6 +406,13 @@ impl World {
             let id = self.alloc_id();
             let mut fire = FireController::new(self.config.enemy_fire);
             fire.autofire = true;
+            self.bonuses.spawns_since_carrier =
+                self.bonuses.spawns_since_carrier.saturating_add(1);
+            let carries = self.bonuses.spawns_since_carrier
+                >= self.bonuses.catalog.drop_every_kills.max(1);
+            if carries {
+                self.bonuses.spawns_since_carrier = 0;
+            }
             self.tanks.push(Tank {
                 id,
                 team: Team::Enemy,
@@ -362,9 +421,10 @@ impl World {
                 y: cy,
                 dir: Dir::Down,
                 fire,
-                // Stationary for now; AI is phase 4. They still shoot downward.
+                // Seek letters in update_enemy_bonus_seek; otherwise stand & shoot.
                 move_dir: None,
                 mods: TankMods::default(),
+                carries_bonus: carries,
             });
             self.wave.on_spawned();
             self.next_enemy_spawn = (idx + 1) % n;
@@ -474,8 +534,10 @@ impl World {
             if let Some(pos) = self.tanks.iter().position(|t| t.id == tid) {
                 let team = self.tanks[pos].team;
                 let kind = self.tanks[pos].enemy_kind;
+                let carries = self.tanks[pos].carries_bonus;
                 let (dx, dy) = (self.tanks[pos].x, self.tanks[pos].y);
                 self.bonuses.cancel_on_death(team, tid);
+                self.bonuses.clear_enemy_clock_if(tid);
                 self.tanks.swap_remove(pos);
                 self.bullets.retain(|b| b.owner_id != tid);
                 match team {
@@ -483,7 +545,9 @@ impl World {
                         self.wave.on_destroyed();
                         let (pts, _) = self.style.award_kill(&self.config.score, kind);
                         self.progress.add_score(pts);
-                        drop_positions.push((dx, dy));
+                        if carries {
+                            drop_positions.push((dx, dy));
+                        }
                     }
                     Team::Player => {
                         player_died = true;
@@ -493,7 +557,7 @@ impl World {
         }
 
         for (x, y) in drop_positions {
-            self.maybe_drop_pickup(x, y);
+            self.spawn_catalog_pickup(x, y);
         }
 
         if player_died {
@@ -580,16 +644,13 @@ impl World {
             .map(|t| self.live_bullets(t.id))
             .collect();
         let enemies_frozen = self.bonuses.opponents_frozen(Team::Enemy);
-        let player_frozen = self.bonuses.opponents_frozen(Team::Player);
 
         let mut shots: Vec<(u64, Team, f32, f32, Dir, f32)> = Vec::new();
         for (tank, &live) in self.tanks.iter_mut().zip(live_counts.iter()) {
-            let frozen = match tank.team {
-                Team::Enemy => enemies_frozen,
-                Team::Player => player_frozen,
-            };
+            // Player may shoot while frozen; only enemies lose fire when clocked.
+            let fire_locked = tank.team == Team::Enemy && enemies_frozen;
             tank.fire.tick(dt);
-            if frozen {
+            if fire_locked {
                 continue;
             }
             if tank.fire.try_fire(live) {
@@ -694,15 +755,11 @@ impl World {
         base_destroyed
     }
 
-    fn maybe_drop_pickup(&mut self, near_x: f32, near_y: f32) {
+    /// Drop the next catalog letter (carrier kill). Position is randomized on the map.
+    fn spawn_catalog_pickup(&mut self, near_x: f32, near_y: f32) {
         if self.bonuses.catalog.defs.is_empty() {
             return;
         }
-        self.bonuses.kills_since_drop = self.bonuses.kills_since_drop.saturating_add(1);
-        if self.bonuses.kills_since_drop < self.bonuses.catalog.drop_every_kills {
-            return;
-        }
-        self.bonuses.kills_since_drop = 0;
         let Some(def) = self
             .bonuses
             .catalog
@@ -830,7 +887,15 @@ impl World {
 
         let timed = def.duration_secs > 0.0;
         let sticky = def.cancel.on_death || def.cancel.on_level_end;
-        if timed || sticky {
+        // Enemy H/C are handled as permanent rules — no timed ActiveBonus (no god-mode).
+        let skip_active = team == Team::Enemy
+            && def.effects.iter().all(|e| {
+                matches!(
+                    e,
+                    EffectKind::Invuln | EffectKind::FreezeOpponents
+                )
+            });
+        if (timed || sticky) && !skip_active {
             self.bonuses.active.push(ActiveBonus {
                 bonus_id: def.id.clone(),
                 letter: def.letter,
@@ -862,9 +927,18 @@ impl World {
                 if team == Team::Player {
                     self.progress.invuln_remaining =
                         self.progress.invuln_remaining.max(def.duration_secs);
-                }
-                if let Some(t) = self.tanks.iter_mut().find(|t| t.id == tank_id) {
-                    t.mods.invuln = true;
+                    if let Some(t) = self.tanks.iter_mut().find(|t| t.id == tank_id) {
+                        t.mods.invuln = true;
+                    }
+                } else {
+                    // Enemy H: permanent armor (multi-hit via ★), no god-mode timer.
+                    if let Some(t) = self.tanks.iter_mut().find(|t| t.id == tank_id) {
+                        t.mods.armored = true;
+                        t.mods.upgrade =
+                            (t.mods.upgrade + 2).min(TankMods::MAX_UPGRADE).max(2);
+                        t.mods.sync_forest();
+                    }
+                    self.refresh_tank_fire(tank_id);
                 }
             }
             EffectKind::FreezeOpponents => {
@@ -874,6 +948,8 @@ impl World {
                             self.bonuses.freeze_enemy_secs.max(def.duration_secs);
                     }
                     Team::Enemy => {
+                        // Timed freeze: player can shoot, cannot move.
+                        self.bonuses.freeze_player_by_enemy = None;
                         self.bonuses.freeze_player_secs =
                             self.bonuses.freeze_player_secs.max(def.duration_secs);
                     }
@@ -882,8 +958,9 @@ impl World {
             EffectKind::FortifyBase => {
                 if team == Team::Player {
                     self.apply_fortify_walls(def.duration_secs);
+                } else {
+                    self.apply_weaken_base();
                 }
-                // Enemy shovel weaken — phase 3.2 polish.
             }
             EffectKind::KillOpponents => {
                 let victims: Vec<u64> = self
@@ -892,18 +969,25 @@ impl World {
                     .filter(|t| t.team != team)
                     .map(|t| t.id)
                     .collect();
+                let mut drops: Vec<(f32, f32)> = Vec::new();
                 for vid in victims {
                     if let Some(pos) = self.tanks.iter().position(|t| t.id == vid) {
                         let vteam = self.tanks[pos].team;
                         let kind = self.tanks[pos].enemy_kind;
+                        let carries = self.tanks[pos].carries_bonus;
+                        let (dx, dy) = (self.tanks[pos].x, self.tanks[pos].y);
                         self.bonuses.cancel_on_death(vteam, vid);
                         self.tanks.swap_remove(pos);
                         self.bullets.retain(|b| b.owner_id != vid);
                         if vteam == Team::Enemy {
+                            self.bonuses.clear_enemy_clock_if(vid);
                             self.wave.on_destroyed();
                             if team == Team::Player {
                                 let (pts, _) = self.style.award_kill(&self.config.score, kind);
                                 self.progress.add_score(pts);
+                            }
+                            if carries {
+                                drops.push((dx, dy));
                             }
                         } else if vteam == Team::Player {
                             self.style.on_player_death();
@@ -916,6 +1000,9 @@ impl World {
                         }
                     }
                 }
+                for (x, y) in drops {
+                    self.spawn_catalog_pickup(x, y);
+                }
             }
             EffectKind::TankUpgrade => {
                 if let Some(t) = self.tanks.iter_mut().find(|t| t.id == tank_id) {
@@ -924,7 +1011,13 @@ impl World {
                     } else {
                         def.max_stacks.min(u32::from(TankMods::MAX_UPGRADE)) as u8
                     };
-                    t.mods.upgrade = (t.mods.upgrade + 1).min(cap);
+                    let next = (t.mods.upgrade + 1).min(cap);
+                    // Enemy star: from the first pickup they can break steel (броня).
+                    t.mods.upgrade = if team == Team::Enemy {
+                        next.max(TankMods::MAX_FIRE_UPGRADE)
+                    } else {
+                        next
+                    };
                     t.mods.sync_forest();
                     if team == Team::Player {
                         self.progress.tank_upgrade = t.mods.upgrade;
@@ -933,17 +1026,32 @@ impl World {
                 }
             }
             EffectKind::MaxUpgrade => {
-                // 1st gun → ★3 (fire/steel); 2nd gun (or gun at ★3+) → ★4 forest.
-                if let Some(t) = self.tanks.iter_mut().find(|t| t.id == tank_id) {
+                if team == Team::Enemy {
+                    // Enemy gun: ALL enemies become armored + break steel.
+                    let ids: Vec<u64> = self
+                        .tanks
+                        .iter()
+                        .filter(|t| t.team == Team::Enemy)
+                        .map(|t| t.id)
+                        .collect();
+                    for eid in ids {
+                        if let Some(t) = self.tanks.iter_mut().find(|t| t.id == eid) {
+                            t.mods.armored = true;
+                            t.mods.upgrade =
+                                t.mods.upgrade.max(TankMods::MAX_FIRE_UPGRADE);
+                            t.mods.sync_forest();
+                        }
+                        self.refresh_tank_fire(eid);
+                    }
+                } else if let Some(t) = self.tanks.iter_mut().find(|t| t.id == tank_id) {
+                    // Player: 1st gun → ★3; 2nd → ★4 forest.
                     if t.mods.upgrade < TankMods::MAX_FIRE_UPGRADE {
                         t.mods.upgrade = TankMods::MAX_FIRE_UPGRADE;
                     } else {
                         t.mods.upgrade = TankMods::MAX_UPGRADE;
                     }
                     t.mods.sync_forest();
-                    if team == Team::Player {
-                        self.progress.tank_upgrade = t.mods.upgrade;
-                    }
+                    self.progress.tank_upgrade = t.mods.upgrade;
                     self.refresh_tank_fire(tank_id);
                 }
             }
@@ -1028,8 +1136,14 @@ impl World {
                 .iter()
                 .filter(|a| a.tank_id == Some(tank.id))
                 .collect();
-            let invuln = mine.iter().any(|a| a.effects.contains(&EffectKind::Invuln))
-                || (tank.team == Team::Player && player_invuln);
+            // Enemies never get timed god-mode; H → armored + ★ instead.
+            let invuln = match tank.team {
+                Team::Player => {
+                    mine.iter().any(|a| a.effects.contains(&EffectKind::Invuln))
+                        || player_invuln
+                }
+                Team::Enemy => false,
+            };
             let ship_bonus = (tank.team == Team::Player && player_ship)
                 || mine
                     .iter()
@@ -1046,6 +1160,289 @@ impl World {
         map.tiles_overlapping(cx, cy, half, half)
             .iter()
             .any(|(_, _, tile)| *tile == Tile::Water)
+    }
+
+    /// Only **one** nearest enemy seeks a letter — avoids pile-ups / stuck pairs.
+    /// Uses grid BFS so seekers go around walls instead of pushing into them.
+    fn update_enemy_bonus_seek(&mut self) {
+        for t in &mut self.tanks {
+            if t.team == Team::Enemy {
+                t.move_dir = None;
+            }
+        }
+        if self.bonuses.opponents_frozen(Team::Enemy) {
+            return;
+        }
+
+        let targets: Vec<(f32, f32)> = self
+            .bonuses
+            .pickups
+            .iter()
+            .filter_map(|p| {
+                let def = self.bonuses.catalog.get(&p.bonus_id)?;
+                if def.who.allows(Team::Enemy) {
+                    Some((p.x, p.y))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+
+        let mut best_pair: Option<(u64, f32, f32, f32)> = None; // eid, tx, ty, dist
+        for t in self.tanks.iter().filter(|t| t.team == Team::Enemy) {
+            for &(tx, ty) in &targets {
+                let dist = (tx - t.x).hypot(ty - t.y);
+                let better = match best_pair {
+                    None => true,
+                    Some((_, _, _, d)) => dist < d,
+                };
+                if better {
+                    best_pair = Some((t.id, tx, ty, dist));
+                }
+            }
+        }
+        let Some((eid, tx, ty, _)) = best_pair else {
+            return;
+        };
+        let Some((ex, ey, water_walk)) = self.tanks.iter().find(|t| t.id == eid).map(|t| {
+            (t.x, t.y, t.mods.water_walk)
+        }) else {
+            return;
+        };
+        let dir = self.seek_dir(eid, ex, ey, tx, ty, water_walk);
+        if let Some(tank) = self.tanks.iter_mut().find(|t| t.id == eid) {
+            tank.move_dir = dir;
+            if let Some(d) = dir {
+                tank.dir = d;
+            }
+        }
+    }
+
+    fn dir_toward(from_x: f32, from_y: f32, to_x: f32, to_y: f32) -> Option<Dir> {
+        let dx = to_x - from_x;
+        let dy = to_y - from_y;
+        const EPS: f32 = 0.12;
+        if dx.abs() < EPS && dy.abs() < EPS {
+            return None;
+        }
+        if dx.abs() >= dy.abs() {
+            if dx > 0.0 {
+                Some(Dir::Right)
+            } else {
+                Some(Dir::Left)
+            }
+        } else if dy > 0.0 {
+            Some(Dir::Down)
+        } else {
+            Some(Dir::Up)
+        }
+    }
+
+    /// BFS waypoint + collision probe so seekers clear corners instead of wedging into walls.
+    fn seek_dir(
+        &self,
+        tank_id: u64,
+        from_x: f32,
+        from_y: f32,
+        to_x: f32,
+        to_y: f32,
+        water_walk: bool,
+    ) -> Option<Dir> {
+        let (wx, wy) = self
+            .path_waypoint(from_x, from_y, to_x, to_y, water_walk)
+            .unwrap_or((to_x, to_y));
+        let half = self.config.tank_half;
+        let probe = half.max(0.2);
+        let mut candidates: Vec<Dir> = Vec::with_capacity(4);
+        if let Some(d) = Self::dir_toward(from_x, from_y, wx, wy) {
+            candidates.push(d);
+        }
+        // Secondary axis toward the waypoint (clears corners when primary is blocked).
+        let dx = wx - from_x;
+        let dy = wy - from_y;
+        if dx.abs() >= 0.05 && dy.abs() >= 0.05 {
+            let secondary = if dx.abs() >= dy.abs() {
+                if dy > 0.0 {
+                    Dir::Down
+                } else {
+                    Dir::Up
+                }
+            } else if dx > 0.0 {
+                Dir::Right
+            } else {
+                Dir::Left
+            };
+            if !candidates.contains(&secondary) {
+                candidates.push(secondary);
+            }
+        }
+        for dir in [Dir::Up, Dir::Down, Dir::Left, Dir::Right] {
+            if !candidates.contains(&dir) {
+                candidates.push(dir);
+            }
+        }
+        for dir in candidates {
+            let (ddx, ddy) = dir.delta();
+            let nx = from_x + ddx * probe;
+            let ny = from_y + ddy * probe;
+            if self.can_tank_move(tank_id, nx, ny, half, water_walk) {
+                return Some(dir);
+            }
+        }
+        None
+    }
+
+    /// Center of the next BFS cell toward the pickup (or the pickup itself if same cell).
+    fn path_waypoint(
+        &self,
+        from_x: f32,
+        from_y: f32,
+        to_x: f32,
+        to_y: f32,
+        water_walk: bool,
+    ) -> Option<(f32, f32)> {
+        let sx = from_x.floor() as i32;
+        let sy = from_y.floor() as i32;
+        let gx = to_x.floor() as i32;
+        let gy = to_y.floor() as i32;
+        if sx == gx && sy == gy {
+            return Some((to_x, to_y));
+        }
+
+        let w = self.map.width() as i32;
+        let h = self.map.height() as i32;
+        if !(0..w).contains(&sx)
+            || !(0..h).contains(&sy)
+            || !(0..w).contains(&gx)
+            || !(0..h).contains(&gy)
+        {
+            return Some((to_x, to_y));
+        }
+
+        let walkable = |x: i32, y: i32| -> bool {
+            if x < 0 || y < 0 || x >= w || y >= h {
+                return false;
+            }
+            match self.map.get(x as u32, y as u32) {
+                Some(Tile::Water) => water_walk,
+                Some(t) => !t.blocks_tank(),
+                None => false,
+            }
+        };
+        if !walkable(gx, gy) {
+            return Some((to_x, to_y));
+        }
+
+        let idx = |x: i32, y: i32| -> usize { (y * w + x) as usize };
+        let mut came = vec![None::<(i32, i32, Dir)>; (w * h) as usize];
+        let mut q = VecDeque::new();
+        q.push_back((sx, sy));
+        came[idx(sx, sy)] = Some((-1, -1, Dir::Up));
+
+        const STEPS: [(Dir, i32, i32); 4] = [
+            (Dir::Up, 0, -1),
+            (Dir::Down, 0, 1),
+            (Dir::Left, -1, 0),
+            (Dir::Right, 1, 0),
+        ];
+
+        let mut found = false;
+        while let Some((x, y)) = q.pop_front() {
+            if x == gx && y == gy {
+                found = true;
+                break;
+            }
+            for &(dir, dx, dy) in &STEPS {
+                let nx = x + dx;
+                let ny = y + dy;
+                if !walkable(nx, ny) {
+                    continue;
+                }
+                let i = idx(nx, ny);
+                if came[i].is_some() {
+                    continue;
+                }
+                came[i] = Some((x, y, dir));
+                q.push_back((nx, ny));
+            }
+        }
+        if !found {
+            return Some((to_x, to_y));
+        }
+
+        let mut cx = gx;
+        let mut cy = gy;
+        let mut first_dir = None;
+        while !(cx == sx && cy == sy) {
+            let Some((px, py, dir)) = came[idx(cx, cy)] else {
+                break;
+            };
+            if px < 0 {
+                break;
+            }
+            first_dir = Some(dir);
+            if px == sx && py == sy {
+                break;
+            }
+            cx = px;
+            cy = py;
+        }
+        let dir = first_dir?;
+        let (dx, dy) = match dir {
+            Dir::Up => (0, -1),
+            Dir::Down => (0, 1),
+            Dir::Left => (-1, 0),
+            Dir::Right => (1, 0),
+        };
+        Some(((sx + dx) as f32 + 0.5, (sy + dy) as f32 + 0.5))
+    }
+
+    /// Enemy shovel: strip player fortify and turn base-ring steel/brick into brick/empty weak walls.
+    fn apply_weaken_base(&mut self) {
+        if self.bonuses.fortify_secs > 0.0 {
+            self.restore_fortify_walls();
+        }
+        let bases: Vec<(u32, u32)> = {
+            let mut v = Vec::new();
+            for y in 0..self.map.height() {
+                for x in 0..self.map.width() {
+                    if self.map.get(x, y) == Some(Tile::Base) {
+                        v.push((x, y));
+                    }
+                }
+            }
+            v
+        };
+        for (bx, by) in bases {
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let x = bx as i32 + dx;
+                    let y = by as i32 + dy;
+                    if x < 0 || y < 0 {
+                        continue;
+                    }
+                    let (x, y) = (x as u32, y as u32);
+                    if x >= self.map.width() || y >= self.map.height() {
+                        continue;
+                    }
+                    match self.map.get(x, y) {
+                        Some(Tile::Steel) => {
+                            let _ = self.map.set(x, y, Tile::Brick);
+                        }
+                        Some(Tile::Brick) => {
+                            let _ = self.map.set(x, y, Tile::Empty);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     fn apply_fortify_walls(&mut self, duration: f32) {

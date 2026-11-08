@@ -418,6 +418,8 @@ pub struct TankMods {
     pub water_walk: bool,
     pub forest_clear: bool,
     pub invuln: bool,
+    /// Enemy helmet: permanent armor look; hits still peel ★ / then death.
+    pub armored: bool,
 }
 
 impl TankMods {
@@ -450,10 +452,14 @@ pub struct BonusState {
     /// Seconds opponents stay frozen (`Team` = who is frozen).
     pub freeze_player_secs: f32,
     pub freeze_enemy_secs: f32,
+    /// Enemy clock: freeze player until this enemy id dies (`None` = off).
+    pub freeze_player_by_enemy: Option<u64>,
     /// Shovel fortify timer (player-side steel walls).
     pub fortify_secs: f32,
     /// Saved base-ring tiles to restore when fortify ends: (x, y, tile_as_u8).
     pub fortify_backup: Vec<(u32, u32, u8)>,
+    /// Spawns since last bonus-carrier marking.
+    pub spawns_since_carrier: u32,
 }
 
 impl BonusState {
@@ -466,8 +472,10 @@ impl BonusState {
             next_drop_index: 0,
             freeze_player_secs: 0.0,
             freeze_enemy_secs: 0.0,
+            freeze_player_by_enemy: None,
             fortify_secs: 0.0,
             fortify_backup: Vec::new(),
+            spawns_since_carrier: 0,
         }
     }
 
@@ -502,6 +510,12 @@ impl BonusState {
         match team {
             Team::Player => self.freeze_player_secs > 0.0,
             Team::Enemy => self.freeze_enemy_secs > 0.0,
+        }
+    }
+
+    pub fn clear_enemy_clock_if(&mut self, enemy_id: u64) {
+        if self.freeze_player_by_enemy == Some(enemy_id) {
+            self.freeze_player_by_enemy = None;
         }
     }
 

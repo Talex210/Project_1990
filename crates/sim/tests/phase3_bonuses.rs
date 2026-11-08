@@ -1,4 +1,4 @@
-//! Phase 3.1 gate: data-driven catalog + pickup / apply.
+//! Phase 3.1–3.2 gate: data-driven catalog, letters, enemies take bonuses.
 
 use project1990_sim::{
     BonusCatalog, Dir, EffectKind, FireConfig, Map, PickupWho, SimConfig, SimInput, Team, Tile,
@@ -47,6 +47,11 @@ fn shipped_catalog_parses_all_classic_letters() {
     assert_eq!(cat.get("star").unwrap().max_stacks, 4);
     assert_eq!(cat.get("ship").unwrap().duration_secs, 0.0);
     assert_eq!(cat.get("tank").unwrap().who, PickupWho::Player);
+    assert_eq!(
+        cat.get("clock").unwrap().duration_secs,
+        4.0,
+        "freeze shorter than classic ~10s"
+    );
 }
 
 #[test]
@@ -249,6 +254,7 @@ X....
             fire: project1990_sim::FireController::new(world.config.enemy_fire),
             move_dir: Some(Dir::Down),
             mods: Default::default(),
+        carries_bonus: false,
         });
         id
     });
@@ -469,6 +475,7 @@ X....
         fire: project1990_sim::FireController::new(world.config.enemy_fire),
         move_dir: None,
         mods: Default::default(),
+        carries_bonus: true,
     });
     world.wave.on_spawned();
 
@@ -504,4 +511,292 @@ X....
         p.x,
         p.y
     );
+}
+
+#[test]
+fn enemy_seeks_and_picks_up_helmet() {
+    let mut world = world_with_catalog(
+        "\
+.....
+X....
+..P..
+",
+    );
+    world.tanks.push(project1990_sim::Tank {
+        id: 88,
+        team: Team::Enemy,
+        enemy_kind: Default::default(),
+        x: 0.5,
+        y: 1.5,
+        dir: Dir::Down,
+        fire: project1990_sim::FireController::new(world.config.enemy_fire),
+        move_dir: None,
+        mods: Default::default(),
+    carries_bonus: false,
+    });
+    world.spawn_pickup_at("helmet", 3.5, 1.5).unwrap();
+    for _ in 0..120 {
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        if world.bonuses.pickups.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        world.bonuses.pickups.is_empty(),
+        "enemy should collect the helmet"
+    );
+    let enemy = world.tanks.iter().find(|t| t.id == 88).unwrap();
+    assert!(enemy.mods.armored, "enemy helmet must grant permanent armor");
+    assert!(enemy.mods.upgrade >= 2, "armor comes with multi-hit ★");
+    assert!(!enemy.mods.invuln, "enemy H must not be timed god-mode");
+    assert!(!world.enemy_power_labels().is_empty());
+}
+
+#[test]
+fn enemy_seeks_around_wall_to_bonus() {
+    // Wall blocks the straight path; BFS must go around.
+    // X # . .
+    // . . . .
+    // . . . H(pickup)
+    // . P . .
+    let mut world = world_with_catalog(
+        "\
+X#..
+....
+....
+.P..
+",
+    );
+    world.tanks.push(project1990_sim::Tank {
+        id: 89,
+        team: Team::Enemy,
+        enemy_kind: Default::default(),
+        x: 0.5,
+        y: 0.5,
+        dir: Dir::Right,
+        fire: project1990_sim::FireController::new(world.config.enemy_fire),
+        move_dir: None,
+        mods: Default::default(),
+        carries_bonus: false,
+    });
+    world.spawn_pickup_at("helmet", 3.5, 0.5).unwrap();
+    for _ in 0..400 {
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        if world.bonuses.pickups.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        world.bonuses.pickups.is_empty(),
+        "enemy must path around the wall to the letter"
+    );
+}
+
+#[test]
+fn enemy_shovel_weakens_base_walls() {
+    let mut world = world_with_catalog(
+        "\
+.....
+..P..
+.#E#.
+.###.
+",
+    );
+    assert_eq!(world.map.get(1, 2), Some(Tile::Brick));
+    assert_eq!(world.map.get(2, 2), Some(Tile::Base));
+    world.tanks.push(project1990_sim::Tank {
+        id: 90,
+        team: Team::Enemy,
+        enemy_kind: Default::default(),
+        x: 0.5,
+        y: 0.5,
+        dir: Dir::Down,
+        fire: project1990_sim::FireController::new(world.config.enemy_fire),
+        move_dir: None,
+        mods: Default::default(),
+    carries_bonus: false,
+    });
+    world.spawn_pickup_at("shovel", 0.5, 0.5).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert_eq!(
+        world.map.get(1, 2),
+        Some(Tile::Empty),
+        "enemy shovel should clear brick beside base"
+    );
+}
+
+#[test]
+fn enemy_clock_freezes_player() {
+    let mut world = world_with_catalog(
+        "\
+.....
+X....
+..P..
+",
+    );
+    world.tanks.push(project1990_sim::Tank {
+        id: 91,
+        team: Team::Enemy,
+        enemy_kind: Default::default(),
+        x: 0.5,
+        y: 1.5,
+        dir: Dir::Down,
+        fire: project1990_sim::FireController::new(world.config.enemy_fire),
+        move_dir: None,
+        mods: Default::default(),
+    carries_bonus: false,
+    });
+    world.spawn_pickup_at("clock", 0.5, 1.5).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert!(world.bonuses.freeze_player_secs > 0.0);
+    assert!(world.bonuses.opponents_frozen(Team::Player));
+    // Frozen player can still authorize fire.
+    {
+        let p = world.player_mut().unwrap();
+        p.fire.set_fire_held(true);
+        p.fire.cooldown = 0.0;
+        assert!(p.fire.try_fire(0), "frozen player must still shoot");
+    }
+}
+
+#[test]
+fn enemy_star_breaks_steel() {
+    let mut world = world_with_catalog(
+        "\
+S....
+X....
+..P..
+",
+    );
+    world.tanks.push(project1990_sim::Tank {
+        id: 94,
+        team: Team::Enemy,
+        enemy_kind: Default::default(),
+        x: 0.5,
+        y: 1.5,
+        dir: Dir::Up,
+        fire: project1990_sim::FireController::new(FireConfig {
+            fire_interval: 0.0,
+            max_bullets: 4,
+        }),
+        move_dir: None,
+        mods: Default::default(),
+        carries_bonus: false,
+    });
+    world.spawn_pickup_at("star", 0.5, 1.5).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    let enemy = world.tanks.iter().find(|t| t.id == 94).unwrap();
+    assert!(enemy.mods.upgrade >= 3, "enemy ★ unlocks steel break");
+    {
+        let e = world.tanks.iter_mut().find(|t| t.id == 94).unwrap();
+        e.fire.autofire = true;
+        e.fire.cooldown = 0.0;
+        e.x = 0.5;
+        e.y = 1.5;
+        e.dir = Dir::Up;
+    }
+    for _ in 0..40 {
+        world.step(&SimInput::default(), 1.0 / 60.0);
+    }
+    assert_eq!(world.map.get(0, 0), Some(Tile::Empty), "enemy ★ breaks steel");
+}
+
+#[test]
+fn enemy_gun_armors_all_enemies() {
+    let mut world = world_with_catalog(
+        "\
+.....
+X..X.
+..P..
+",
+    );
+    for (id, x) in [(95u64, 0.5), (96, 3.5)] {
+        world.tanks.push(project1990_sim::Tank {
+            id,
+            team: Team::Enemy,
+            enemy_kind: Default::default(),
+            x,
+            y: 1.5,
+            dir: Dir::Down,
+            fire: project1990_sim::FireController::new(world.config.enemy_fire),
+            move_dir: None,
+            mods: Default::default(),
+            carries_bonus: false,
+        });
+    }
+    world.spawn_pickup_at("gun", 0.5, 1.5).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    for id in [95u64, 96] {
+        let e = world.tanks.iter().find(|t| t.id == id).unwrap();
+        assert!(e.mods.armored, "gun must armor every enemy ({id})");
+        assert!(e.mods.upgrade >= 3, "gun must grant steel break ({id})");
+    }
+}
+
+#[test]
+fn enemy_grenade_destroys_player_without_stars() {
+    let mut world = world_with_catalog(
+        "\
+.....
+X....
+..P..
+",
+    );
+    world.tanks.push(project1990_sim::Tank {
+        id: 92,
+        team: Team::Enemy,
+        enemy_kind: Default::default(),
+        x: 0.5,
+        y: 1.5,
+        dir: Dir::Down,
+        fire: project1990_sim::FireController::new(world.config.enemy_fire),
+        move_dir: None,
+        mods: Default::default(),
+    carries_bonus: false,
+    });
+    let lives_before = world.progress.lives;
+    world.spawn_pickup_at("grenade", 0.5, 1.5).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert!(
+        world.progress.lives < lives_before || world.player().is_none(),
+        "enemy grenade should hit the player stock"
+    );
+}
+
+#[test]
+fn enemy_star_absorbs_player_bullet() {
+    let mut world = world_with_catalog(
+        "\
+X....
+.....
+..P..
+",
+    );
+    world.tanks.push(project1990_sim::Tank {
+        id: 93,
+        team: Team::Enemy,
+        enemy_kind: Default::default(),
+        x: 0.5,
+        y: 0.5,
+        dir: Dir::Down,
+        fire: project1990_sim::FireController::new(world.config.enemy_fire),
+        move_dir: None,
+        mods: project1990_sim::TankMods {
+            upgrade: 2,
+            ..Default::default()
+        },
+    carries_bonus: false,
+    });
+    world.bullets.push(project1990_sim::Bullet {
+        id: 501,
+        owner_id: world.player_tank_id(),
+        team: Team::Player,
+        x: 0.5,
+        y: 0.5,
+        dir: Dir::Up,
+        speed: 6.0,
+    });
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    let enemy = world.tanks.iter().find(|t| t.id == 93).unwrap();
+    assert_eq!(enemy.mods.upgrade, 1, "enemy star should absorb one hit");
 }

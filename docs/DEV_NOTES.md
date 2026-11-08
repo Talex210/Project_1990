@@ -7,6 +7,8 @@ Cargo.toml                 # workspace
 crates/sim/                # project1990-sim — headless логика + тесты
 crates/game/               # project1990 — Bevy-окно, ввод, спрайты
 data/maps/                 # level_001..003, placeholder, test_level (все 16×16)
+                           # HQ (E): классика — низ карты, вплотную к нижней границе;
+                           # кольцо сейчас сталь (S) для тестов; кирпич (#) — позже
 data/levels/manifest.txt   # 100 stages → map + wave params
 data/score.cfg             # таблица очков
 .github/workflows/ci.yml   # cargo test --workspace
@@ -43,10 +45,11 @@ data/score.cfg             # таблица очков
 
 ## Data-driven бонусы — что это
 
-Каталог: `data/bonuses/catalog.cfg` (секции `[id]`, `key=value`). Код: `crates/sim/src/bonus.rs` + wiring в `world.rs`.  
-После убийства врага (каждые `drop_every_kills`) на поле появляется pickup; HUD: `BONUS active:… field:…`.
+Каталог: `data/bonuses/catalog.cfg`. Код: `crates/sim/src/bonus.rs` + `world.rs`.  
+Дроп каждые `drop_every_kills` (сейчас 1 для тестов); враги seek’ят буквы по BFS. HUD: `ACTIVE` / `ON MAP` / `ENEMY`.  
+Clock: классика ~10 с → у нас 4 с. **Мигание танков-носителей — отложено** (см. BONUSES.md).
 
-Подробнее и списки: [BONUSES.md](BONUSES.md). Gate 3.1: `cargo test -p project1990-sim --test phase3_bonuses`.
+Подробнее: [BONUSES.md](BONUSES.md). Gate: `cargo test -p project1990-sim --test phase3_bonuses`.
 
 ## На каком «движке» ИИ
 
