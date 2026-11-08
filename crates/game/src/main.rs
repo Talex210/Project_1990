@@ -763,8 +763,10 @@ fn sync_play(
 
     let invuln = sim.0.progress.is_invulnerable()
         || sim.0.player().map(|t| t.mods.invuln).unwrap_or(false);
+    // Shared blink phase. Do NOT gate it on player invuln — that froze carrier blink.
+    let blink_phase = (sim.0.tick / 8) % 2 == 0;
+    let player_blink_on = !invuln || blink_phase;
 
-    // Tank blink (carrier / armor / invuln flicker) deferred — solid tints for now.
     let live_tanks: Vec<(u64, Team, f32, f32, Dir, u8, bool, bool, bool, bool)> = sim
         .0
         .tanks
@@ -797,12 +799,26 @@ fn sync_play(
             tf.rotation = Quat::from_rotation_z(dir_angle(*dir));
             let mut color = team_color(*team);
             if *team == Team::Player && invuln {
-                color = Color::srgb(0.85, 1.0, 0.9);
+                color = if player_blink_on {
+                    Color::srgb(0.85, 1.0, 0.9)
+                } else {
+                    Color::srgba(0.2, 0.85, 0.35, 0.25)
+                };
             } else if *team == Team::Enemy {
+                // Classic: bonus carrier blinks white/red.
                 if *carries {
-                    color = Color::srgb(0.95, 0.9, 0.85);
+                    color = if blink_phase {
+                        Color::srgb(1.0, 1.0, 1.0)
+                    } else {
+                        Color::srgb(0.9, 0.25, 0.2)
+                    };
                 } else if *armored {
-                    color = Color::srgb(1.0, 0.85, 0.2);
+                    // Tank 1990 life / helmet armor — green blink.
+                    color = if blink_phase {
+                        Color::srgb(0.35, 0.95, 0.4)
+                    } else {
+                        Color::srgb(0.15, 0.55, 0.2)
+                    };
                 } else if *upgrade > 0 {
                     color = Color::srgb(0.95, 0.55, 0.15);
                 } else if *ship {
@@ -1080,9 +1096,16 @@ fn hud_text(world: &World, show_help: bool, paused: bool, level: u32) -> String 
 
     let status = match world.outcome {
         RoundOutcome::Playing => {
-            let mut line = format!(
-                "STAGE {level:02}  SCORE {score}  lives {lives}  tank★{upgrade}  enemies {on}/{max} left {left}  AUTO {autofire}"
-            );
+            let mut line = if world.in_clear_grace() {
+                format!(
+                    "STAGE {level:02}  CLEAR! {:.0}s  SCORE {score}  lives {lives}  tank★{upgrade}  AUTO {autofire}",
+                    world.clear_grace_remaining.ceil()
+                )
+            } else {
+                format!(
+                    "STAGE {level:02}  SCORE {score}  lives {lives}  tank★{upgrade}  enemies {on}/{max} left {left}  AUTO {autofire}"
+                )
+            };
             if !active.is_empty() {
                 line.push_str(&format!("\nACTIVE  {}", active.join("  |  ")));
             } else {

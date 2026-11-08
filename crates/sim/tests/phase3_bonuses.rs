@@ -46,7 +46,7 @@ fn shipped_catalog_parses_all_classic_letters() {
     assert_eq!(gun.effects, vec![EffectKind::MaxUpgrade]);
     assert_eq!(cat.get("star").unwrap().max_stacks, 4);
     assert_eq!(cat.get("ship").unwrap().duration_secs, 0.0);
-    assert_eq!(cat.get("tank").unwrap().who, PickupWho::Player);
+    assert_eq!(cat.get("tank").unwrap().who, PickupWho::Both);
     assert_eq!(
         cat.get("clock").unwrap().duration_secs,
         4.0,
@@ -218,6 +218,97 @@ fn tank_letter_adds_life() {
     world.spawn_pickup_at("tank", px, py).unwrap();
     world.step(&SimInput::default(), 1.0 / 60.0);
     assert_eq!(world.progress.lives, lives + 1);
+}
+
+#[test]
+fn enemy_tank_letter_armors_all_enemies() {
+    // Tank 1990: enemy picks T → all on-field enemies gain armor.
+    let mut world = world_with_catalog(
+        "\
+.....
+..P..
+.....
+",
+    );
+    world.tanks.push(project1990_sim::Tank {
+        id: 70,
+        team: Team::Enemy,
+        enemy_kind: Default::default(),
+        x: 0.5,
+        y: 0.5,
+        dir: Dir::Down,
+        fire: project1990_sim::FireController::new(world.config.enemy_fire),
+        move_dir: None,
+        mods: Default::default(),
+        carries_bonus: false,
+    });
+    world.tanks.push(project1990_sim::Tank {
+        id: 71,
+        team: Team::Enemy,
+        enemy_kind: Default::default(),
+        x: 4.5,
+        y: 0.5,
+        dir: Dir::Down,
+        fire: project1990_sim::FireController::new(world.config.enemy_fire),
+        move_dir: None,
+        mods: Default::default(),
+        carries_bonus: false,
+    });
+    world.spawn_pickup_at("tank", 0.5, 0.5).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert!(world.bonuses.pickups.is_empty());
+    let a = world.tanks.iter().find(|t| t.id == 70).unwrap();
+    let b = world.tanks.iter().find(|t| t.id == 71).unwrap();
+    assert!(a.mods.armored && b.mods.armored);
+    assert!(a.mods.upgrade >= 2 && b.mods.upgrade >= 2);
+}
+
+#[test]
+fn shovel_fortify_ejects_tank_standing_in_ring() {
+    // Base with open ring; tank stands where steel will appear.
+    let mut world = world_with_catalog(
+        "\
+.....
+..P..
+..E..
+.....
+",
+    );
+    // Place enemy on cell left of base (1,2) — fortify ring cell.
+    assert_eq!(world.map.get(2, 2), Some(Tile::Base));
+    world.tanks.push(project1990_sim::Tank {
+        id: 72,
+        team: Team::Enemy,
+        enemy_kind: Default::default(),
+        x: 1.5,
+        y: 2.5,
+        dir: Dir::Right,
+        fire: project1990_sim::FireController::new(world.config.enemy_fire),
+        move_dir: None,
+        mods: Default::default(),
+        carries_bonus: false,
+    });
+    let (px, py) = {
+        let p = world.player().unwrap();
+        (p.x, p.y)
+    };
+    world.spawn_pickup_at("shovel", px, py).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert!(world.bonuses.fortify_secs > 0.0);
+    assert_eq!(world.map.get(1, 2), Some(Tile::Steel));
+    let e = world.tanks.iter().find(|t| t.id == 72).unwrap();
+    let half = world.config.tank_half;
+    let blocked = world
+        .map
+        .tiles_overlapping(e.x, e.y, half, half)
+        .iter()
+        .any(|(_, _, t)| t.blocks_tank());
+    assert!(
+        !blocked,
+        "tank must be ejected off fortify steel (at {}, {})",
+        e.x,
+        e.y
+    );
 }
 
 #[test]

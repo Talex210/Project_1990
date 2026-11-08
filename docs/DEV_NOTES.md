@@ -47,9 +47,12 @@ data/score.cfg             # таблица очков
 
 Каталог: `data/bonuses/catalog.cfg`. Код: `crates/sim/src/bonus.rs` + `world.rs`.  
 Дроп каждые `drop_every_kills` (сейчас 1 для тестов); враги seek’ят буквы по BFS. HUD: `ACTIVE` / `ON MAP` / `ENEMY`.  
-Clock: классика ~10 с → у нас 4 с. **Мигание танков-носителей — отложено** (см. BONUSES.md).
+Clock: классика ~10 с → у нас 4 с. Мигание носителей / брони восстановлено.  
+После последнего врага — **clear grace 3 с** (HUD: `CLEAR! Ns`), потом Victory.  
+**3.2 / 3.4 закрыты.** **3.3 свои моды — не сейчас** (см. ROADMAP / BONUSES.md).
 
-Подробнее: [BONUSES.md](BONUSES.md). Gate: `cargo test -p project1990-sim --test phase3_bonuses`.
+Подробнее: [BONUSES.md](BONUSES.md).  
+Gate: `cargo test -p project1990-sim --test phase3_bonuses --test phase3_exclusions`.
 
 ## На каком «движке» ИИ
 

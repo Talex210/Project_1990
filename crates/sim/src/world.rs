@@ -86,6 +86,9 @@ pub struct SimConfig {
     pub enemy_fire: FireConfig,
     /// Data-driven bonus catalog (empty = no drops).
     pub bonuses: BonusCatalog,
+    /// Classic pause after the last enemy dies before Victory (pickups / base still live).
+    /// `0` = resolve Victory on the clear tick (handy for unit tests).
+    pub clear_grace_secs: f32,
 }
 
 impl Default for SimConfig {
@@ -105,6 +108,8 @@ impl Default for SimConfig {
                 max_bullets: 1,
             },
             bonuses: BonusCatalog::default(),
+            // Classic NES feels ~2–4s of free play after the last kill.
+            clear_grace_secs: 3.0,
         }
     }
 }
@@ -143,6 +148,8 @@ pub struct World {
     pub bonuses: BonusState,
     pub outcome: RoundOutcome,
     pub tick: u64,
+    /// Seconds left in post-clear grace (`0` = not in grace / already resolved).
+    pub clear_grace_remaining: f32,
     next_id: u64,
     player_tank_id: u64,
     /// Round-robin index into enemy spawn points.
@@ -165,12 +172,18 @@ impl World {
             bonuses,
             outcome: RoundOutcome::Playing,
             tick: 0,
+            clear_grace_remaining: 0.0,
             next_id: 1,
             player_tank_id: 0,
             next_enemy_spawn: 0,
         };
         world.spawn_player_tank();
         world
+    }
+
+    /// Wave cleared and still in the classic free-play window before Victory.
+    pub fn in_clear_grace(&self) -> bool {
+        self.outcome == RoundOutcome::Playing && self.clear_grace_remaining > 0.0
     }
 
     fn player_spawn_pos(&self) -> (f32, f32) {
@@ -325,6 +338,7 @@ impl World {
         self.bonuses.tick_timers(dt);
         if fortify_was && self.bonuses.fortify_secs <= 0.0 {
             self.restore_fortify_walls();
+            self.eject_blocked_tanks();
         }
         self.sync_tank_mod_flags();
 
@@ -360,18 +374,42 @@ impl World {
         self.spawn_enemies(dt);
 
         if base_hit {
+            self.clear_grace_remaining = 0.0;
             self.outcome = RoundOutcome::DefeatBaseDestroyed;
         } else if self.outcome == RoundOutcome::Playing
             && self.wave.is_cleared(self.enemies_on_field())
         {
-            let (bonus, _) = self.style.award_clear(&self.config.score);
-            self.progress.add_score(bonus);
-            self.bonuses.cancel_on_level_end();
-            self.restore_fortify_walls();
-            self.outcome = RoundOutcome::Victory;
+            self.tick_clear_grace(dt);
         }
 
         self.tick += 1;
+    }
+
+    /// After the last enemy dies: short free-play window (pick up letters / risk the base),
+    /// then award clear score and set Victory.
+    fn tick_clear_grace(&mut self, dt: f32) {
+        if self.clear_grace_remaining <= 0.0 {
+            let grace = self.config.clear_grace_secs.max(0.0);
+            if grace <= 0.0 {
+                self.finalize_victory();
+                return;
+            }
+            self.clear_grace_remaining = grace;
+            return;
+        }
+        self.clear_grace_remaining = (self.clear_grace_remaining - dt).max(0.0);
+        if self.clear_grace_remaining <= 0.0 {
+            self.finalize_victory();
+        }
+    }
+
+    fn finalize_victory(&mut self) {
+        let (bonus, _) = self.style.award_clear(&self.config.score);
+        self.progress.add_score(bonus);
+        self.bonuses.cancel_on_level_end();
+        self.restore_fortify_walls();
+        self.clear_grace_remaining = 0.0;
+        self.outcome = RoundOutcome::Victory;
     }
 
     pub fn is_playing(&self) -> bool {
@@ -449,6 +487,8 @@ impl World {
 
     /// Any overlapping bullets cancel each other (including same team).
     fn resolve_bullet_bullet_hits(&mut self) {
+        // Classic: only a player bullet can cancel an enemy bullet.
+        // Enemy↔enemy (and player↔player) pass through each other.
         let half = self.config.bullet_half;
         let n = self.bullets.len();
         if n < 2 {
@@ -465,6 +505,13 @@ impl World {
                 }
                 let a = &self.bullets[i];
                 let b = &self.bullets[j];
+                let opposing = matches!(
+                    (a.team, b.team),
+                    (Team::Player, Team::Enemy) | (Team::Enemy, Team::Player)
+                );
+                if !opposing {
+                    continue;
+                }
                 let dx = (a.x - b.x).abs();
                 let dy = (a.y - b.y).abs();
                 if dx < half * 2.0 && dy < half * 2.0 {
@@ -958,8 +1005,10 @@ impl World {
             EffectKind::FortifyBase => {
                 if team == Team::Player {
                     self.apply_fortify_walls(def.duration_secs);
+                    self.eject_blocked_tanks();
                 } else {
                     self.apply_weaken_base();
+                    self.eject_blocked_tanks();
                 }
             }
             EffectKind::KillOpponents => {
@@ -1058,6 +1107,9 @@ impl World {
             EffectKind::ExtraLife => {
                 if team == Team::Player {
                     let _ = self.progress.try_add_life();
+                } else {
+                    // Tank 1990: enemy "life" → all on-field enemies gain armor (green durability).
+                    self.armour_all_enemies();
                 }
             }
             EffectKind::WaterWalk => {
@@ -1398,6 +1450,72 @@ impl World {
             Dir::Right => (1, 0),
         };
         Some(((sx + dx) as f32 + 0.5, (sy + dy) as f32 + 0.5))
+    }
+
+    /// Tank 1990 life letter for enemies: every on-field enemy gains armor / multi-hit.
+    fn armour_all_enemies(&mut self) {
+        let ids: Vec<u64> = self
+            .tanks
+            .iter()
+            .filter(|t| t.team == Team::Enemy)
+            .map(|t| t.id)
+            .collect();
+        for eid in ids {
+            if let Some(t) = self.tanks.iter_mut().find(|t| t.id == eid) {
+                t.mods.armored = true;
+                t.mods.upgrade = (t.mods.upgrade + 2).min(TankMods::MAX_UPGRADE).max(2);
+                t.mods.sync_forest();
+            }
+            self.refresh_tank_fire(eid);
+        }
+    }
+
+    /// If fortify/weaken placed walls under a tank, shove it to the nearest free cell.
+    fn eject_blocked_tanks(&mut self) {
+        let half = self.config.tank_half;
+        let w = self.map.width();
+        let h = self.map.height();
+        let ids: Vec<u64> = self.tanks.iter().map(|t| t.id).collect();
+        for id in ids {
+            let Some((x, y, water_walk)) = self
+                .tanks
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| (t.x, t.y, t.mods.water_walk))
+            else {
+                continue;
+            };
+            if Self::tank_fits(&self.map, x, y, half, water_walk) {
+                continue;
+            }
+            let mut best: Option<(f32, f32, f32)> = None; // dist, nx, ny
+            for ty in 0..h {
+                for tx in 0..w {
+                    let nx = tx as f32 + 0.5;
+                    let ny = ty as f32 + 0.5;
+                    if !Self::tank_fits(&self.map, nx, ny, half, water_walk) {
+                        continue;
+                    }
+                    if self.tank_occupies(nx, ny, half, Some(id)) {
+                        continue;
+                    }
+                    let dist = (nx - x).hypot(ny - y);
+                    let better = match best {
+                        None => true,
+                        Some((d, _, _)) => dist < d,
+                    };
+                    if better {
+                        best = Some((dist, nx, ny));
+                    }
+                }
+            }
+            if let Some((_, nx, ny)) = best {
+                if let Some(t) = self.tanks.iter_mut().find(|t| t.id == id) {
+                    t.x = nx;
+                    t.y = ny;
+                }
+            }
+        }
     }
 
     /// Enemy shovel: strip player fortify and turn base-ring steel/brick into brick/empty weak walls.
@@ -2073,6 +2191,7 @@ X......
                     max_on_field: 1,
                     spawn_interval: 0.0,
                 },
+                clear_grace_secs: 0.0,
                 ..Default::default()
             },
         );
@@ -2100,6 +2219,154 @@ X......
         assert_eq!(world.outcome, RoundOutcome::Victory);
         assert_eq!(world.wave.destroyed, 1);
         assert!(world.wave.is_cleared(world.enemies_on_field()));
+    }
+
+    #[test]
+    fn clear_grace_allows_pickup_before_victory() {
+        let mut world = World::new(
+            Map::parse(
+                "\
+X......
+.......
+...P...
+",
+            )
+            .unwrap(),
+            SimConfig {
+                bullet_speed: 40.0,
+                fire: FireConfig {
+                    fire_interval: 0.0,
+                    max_bullets: 4,
+                },
+                wave: WaveConfig {
+                    total_enemies: 1,
+                    max_on_field: 1,
+                    spawn_interval: 0.0,
+                },
+                clear_grace_secs: 0.5,
+                bonuses: BonusCatalog::parse(include_str!("../../../data/bonuses/catalog.cfg"))
+                    .unwrap(),
+                enemy_fire: FireConfig {
+                    fire_interval: 999.0,
+                    max_bullets: 0,
+                },
+                ..Default::default()
+            },
+        );
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        {
+            let p = world.player_mut().unwrap();
+            p.x = 0.5;
+            p.y = 2.5;
+            p.dir = Dir::Up;
+            p.fire.cooldown = 0.0;
+        }
+        for _ in 0..40 {
+            world.step(
+                &SimInput {
+                    fire_held: true,
+                    ..Default::default()
+                },
+                1.0 / 60.0,
+            );
+            if world.in_clear_grace() || world.outcome != RoundOutcome::Playing {
+                break;
+            }
+        }
+        assert!(world.in_clear_grace(), "must enter post-clear grace");
+        assert_eq!(world.outcome, RoundOutcome::Playing);
+        let lives = world.progress.lives;
+        let (px, py) = {
+            let p = world.player().unwrap();
+            (p.x, p.y)
+        };
+        world.spawn_pickup_at("tank", px, py).unwrap();
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        assert_eq!(world.progress.lives, lives + 1, "pickup during grace");
+        assert_eq!(world.outcome, RoundOutcome::Playing);
+        // Burn remaining grace.
+        for _ in 0..60 {
+            world.step(&SimInput::default(), 1.0 / 60.0);
+            if world.outcome != RoundOutcome::Playing {
+                break;
+            }
+        }
+        assert_eq!(world.outcome, RoundOutcome::Victory);
+    }
+
+    #[test]
+    fn clear_grace_base_hit_is_defeat() {
+        let mut world = World::new(
+            Map::parse(
+                "\
+X......
+.......
+...P...
+...E...
+",
+            )
+            .unwrap(),
+            SimConfig {
+                bullet_speed: 40.0,
+                fire: FireConfig {
+                    fire_interval: 0.0,
+                    max_bullets: 4,
+                },
+                wave: WaveConfig {
+                    total_enemies: 1,
+                    max_on_field: 1,
+                    spawn_interval: 0.0,
+                },
+                clear_grace_secs: 2.0,
+                enemy_fire: FireConfig {
+                    fire_interval: 999.0,
+                    max_bullets: 0,
+                },
+                ..Default::default()
+            },
+        );
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        {
+            let p = world.player_mut().unwrap();
+            p.x = 0.5;
+            p.y = 2.5;
+            p.dir = Dir::Up;
+            p.fire.cooldown = 0.0;
+        }
+        for _ in 0..40 {
+            world.step(
+                &SimInput {
+                    fire_held: true,
+                    ..Default::default()
+                },
+                1.0 / 60.0,
+            );
+            if world.in_clear_grace() {
+                break;
+            }
+        }
+        assert!(world.in_clear_grace());
+        // Shoot the base during grace.
+        {
+            let p = world.player_mut().unwrap();
+            p.x = 3.5;
+            p.y = 2.5;
+            p.dir = Dir::Down;
+            p.fire.cooldown = 0.0;
+        }
+        for _ in 0..30 {
+            world.step(
+                &SimInput {
+                    fire_held: true,
+                    ..Default::default()
+                },
+                1.0 / 60.0,
+            );
+            if world.outcome != RoundOutcome::Playing {
+                break;
+            }
+        }
+        assert_eq!(world.outcome, RoundOutcome::DefeatBaseDestroyed);
     }
 
     #[test]
@@ -2239,6 +2506,7 @@ X......
                     fire_interval: 999.0,
                     max_bullets: 0,
                 },
+                clear_grace_secs: 0.0,
                 ..Default::default()
             },
         );
@@ -2299,6 +2567,7 @@ X......
                     fire_interval: 999.0,
                     max_bullets: 0,
                 },
+                clear_grace_secs: 0.0,
                 ..Default::default()
             },
         );
@@ -2364,7 +2633,7 @@ X......
     }
 
     #[test]
-    fn same_team_bullets_also_cancel() {
+    fn enemy_bullets_do_not_cancel_each_other() {
         let mut world = tiny_world(
             "\
 .....
@@ -2391,9 +2660,10 @@ X......
             speed: 6.0,
         });
         world.resolve_bullet_bullet_hits();
-        assert!(
-            world.bullets.is_empty(),
-            "ally/enemy same-team bullets must cancel too"
+        assert_eq!(
+            world.bullets.len(),
+            2,
+            "enemy bullets must pass through each other"
         );
     }
 }

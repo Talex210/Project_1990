@@ -38,6 +38,7 @@ X......
                 fire_interval: 999.0,
                 max_bullets: 0,
             },
+            clear_grace_secs: 0.0,
             ..Default::default()
         },
     )
