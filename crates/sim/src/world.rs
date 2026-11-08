@@ -41,6 +41,17 @@ pub enum Team {
     Enemy,
 }
 
+/// One-shot cues for the presentation layer (cleared at the start of each `step`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SimSfx {
+    Shot,
+    Explosion,
+}
+
+fn tile_center(v: f32) -> f32 {
+    (v - 0.5).round() + 0.5
+}
+
 #[derive(Debug, Clone)]
 pub struct Tank {
     pub id: u64,
@@ -94,8 +105,10 @@ pub struct SimConfig {
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
-            tank_speed: 4.0, // tiles per second
+            // ~8s to cross a 16-tile map — closer to classic BC feel than 4.0.
+            tank_speed: 2.0,
             // Base (no stars); stars multiply via `bullet_speed_for_upgrade`.
+            // Kept ~3× tank so shots stay readable after the speed cut.
             bullet_speed: 6.0,
             tank_half: 0.4,
             bullet_half: 0.12,
@@ -150,6 +163,8 @@ pub struct World {
     pub tick: u64,
     /// Seconds left in post-clear grace (`0` = not in grace / already resolved).
     pub clear_grace_remaining: f32,
+    /// Presentation SFX queued this tick (shot / explosion).
+    pub sfx: Vec<SimSfx>,
     next_id: u64,
     player_tank_id: u64,
     /// Round-robin index into enemy spawn points.
@@ -173,6 +188,7 @@ impl World {
             outcome: RoundOutcome::Playing,
             tick: 0,
             clear_grace_remaining: 0.0,
+            sfx: Vec::new(),
             next_id: 1,
             player_tank_id: 0,
             next_enemy_spawn: 0,
@@ -333,6 +349,7 @@ impl World {
             return;
         }
 
+        self.sfx.clear();
         self.progress.tick_invuln(dt);
         let fortify_was = self.bonuses.fortify_secs > 0.0;
         self.bonuses.tick_timers(dt);
@@ -587,6 +604,7 @@ impl World {
                 self.bonuses.clear_enemy_clock_if(tid);
                 self.tanks.swap_remove(pos);
                 self.bullets.retain(|b| b.owner_id != tid);
+                self.sfx.push(SimSfx::Explosion);
                 match team {
                     Team::Enemy => {
                         self.wave.on_destroyed();
@@ -631,6 +649,8 @@ impl World {
             let Some(dir) = self.tanks[i].move_dir else {
                 continue;
             };
+            // Classic corridor assist: align the cross-axis to a tile center before driving.
+            self.align_tank_to_grid(i, dir, dt);
             let id = self.tanks[i].id;
             let water_walk = self.tanks[i].mods.water_walk;
             let (dx, dy) = dir.delta();
@@ -655,6 +675,35 @@ impl World {
                     self.tanks[i].y = try_y;
                 }
             }
+        }
+    }
+
+    /// Snap (or softly nudge) the axis perpendicular to `dir` toward the nearest tile center.
+    fn align_tank_to_grid(&mut self, i: usize, dir: Dir, dt: f32) {
+        let id = self.tanks[i].id;
+        let half = self.config.tank_half;
+        let water_walk = self.tanks[i].mods.water_walk;
+        let x = self.tanks[i].x;
+        let y = self.tanks[i].y;
+        let (tx, ty) = match dir {
+            Dir::Left | Dir::Right => (x, tile_center(y)),
+            Dir::Up | Dir::Down => (tile_center(x), y),
+        };
+        if (tx - x).abs() < 1e-4 && (ty - y).abs() < 1e-4 {
+            return;
+        }
+        if self.can_tank_move(id, tx, ty, half, water_walk) {
+            self.tanks[i].x = tx;
+            self.tanks[i].y = ty;
+            return;
+        }
+        // Blocked hard-snap (tank overlap / corner) — light settle toward the center.
+        let settle = self.config.tank_speed * dt * 1.25;
+        let nx = x + (tx - x).clamp(-settle, settle);
+        let ny = y + (ty - y).clamp(-settle, settle);
+        if self.can_tank_move(id, nx, ny, half, water_walk) {
+            self.tanks[i].x = nx;
+            self.tanks[i].y = ny;
         }
     }
 
@@ -726,6 +775,7 @@ impl World {
                 dir,
                 speed,
             });
+            self.sfx.push(SimSfx::Shot);
         }
     }
 
@@ -802,20 +852,21 @@ impl World {
         base_destroyed
     }
 
-    /// Drop the next catalog letter (carrier kill). Position is randomized on the map.
+    /// Drop a weighted-random catalog letter (carrier kill). Position is randomized on the map.
     fn spawn_catalog_pickup(&mut self, near_x: f32, near_y: f32) {
         if self.bonuses.catalog.defs.is_empty() {
             return;
         }
-        let Some(def) = self
-            .bonuses
-            .catalog
-            .by_index(self.bonuses.next_drop_index)
-            .cloned()
-        else {
+        let roll = self
+            .tick
+            .wrapping_mul(1_664_525)
+            .wrapping_add(self.next_id)
+            .wrapping_add(self.bonuses.drop_salt)
+            .wrapping_add((near_x * 13.0 + near_y * 29.0) as u64);
+        let Some(def) = self.bonuses.catalog.pick_weighted(roll).cloned() else {
             return;
         };
-        self.bonuses.next_drop_index = self.bonuses.next_drop_index.wrapping_add(1);
+        self.bonuses.drop_salt = self.bonuses.drop_salt.wrapping_add(1);
         let (x, y) = self.random_pickup_spawn_pos(near_x, near_y);
         let lifetime = self.bonuses.catalog.pickup_lifetime_secs;
         let id = self.alloc_id();
@@ -1028,6 +1079,7 @@ impl World {
                         self.bonuses.cancel_on_death(vteam, vid);
                         self.tanks.swap_remove(pos);
                         self.bullets.retain(|b| b.owner_id != vid);
+                        self.sfx.push(SimSfx::Explosion);
                         if vteam == Team::Enemy {
                             self.bonuses.clear_enemy_clock_if(vid);
                             self.wave.on_destroyed();
@@ -2664,6 +2716,64 @@ X......
             world.bullets.len(),
             2,
             "enemy bullets must pass through each other"
+        );
+    }
+
+    #[test]
+    fn grid_settle_snaps_cross_axis_to_tile_center() {
+        let mut world = tiny_world(
+            "\
+....
+....
+.P..
+....
+",
+        );
+        {
+            let p = world.player_mut().unwrap();
+            p.x = 1.5;
+            p.y = 2.2; // off-center on Y; moving horizontally should snap Y → 2.5
+        }
+        world.step(
+            &SimInput {
+                move_dir: Some(Dir::Right),
+                ..Default::default()
+            },
+            1.0 / 60.0,
+        );
+        let p = world.player().unwrap();
+        assert!(
+            (p.y - 2.5).abs() < 1e-3,
+            "expected Y snapped to tile center, got {}",
+            p.y
+        );
+        assert!(p.x > 1.5, "should also advance along X");
+    }
+
+    #[test]
+    fn step_emits_shot_sfx() {
+        let mut world = tiny_world(
+            "\
+...
+.P.
+...
+",
+        );
+        {
+            let p = world.player_mut().unwrap();
+            p.fire.cooldown = 0.0;
+            p.fire.config.fire_interval = 0.0;
+        }
+        world.step(
+            &SimInput {
+                fire_held: true,
+                ..Default::default()
+            },
+            1.0 / 60.0,
+        );
+        assert!(
+            world.sfx.contains(&SimSfx::Shot),
+            "firing should queue Shot sfx"
         );
     }
 }

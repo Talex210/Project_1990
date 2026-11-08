@@ -57,7 +57,15 @@ impl ScoreConfig {
                 .split_once('=')
                 .ok_or(ScoreParseError::BadLine { line: line_no + 1 })?;
             let key = key.trim();
-            let val: u32 = val.trim().parse().map_err(|_| ScoreParseError::BadValue {
+            let val = val.trim();
+            // Lives keys share this file (`LivesConfig::parse`); may be floats (invuln_secs).
+            if matches!(
+                key,
+                "starting_lives" | "max_lives" | "life_every_points" | "invuln_secs"
+            ) {
+                continue;
+            }
+            let val: u32 = val.parse().map_err(|_| ScoreParseError::BadValue {
                 line: line_no + 1,
                 key: key.to_string(),
             })?;

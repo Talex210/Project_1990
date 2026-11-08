@@ -2,14 +2,16 @@
 //!
 //! Simulation lives in `project1990-sim`; this binary only renders and feeds input.
 
+use bevy::audio::{AudioPlayer, Pitch, PlaybackSettings};
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use project1990_sim::{
     default_save_path, BonusCatalog, Campaign, Dir, LEVEL_COUNT, LivesConfig, MAX_NAME_CHARS,
     MAX_PROFILES, PlayerProgress, ProfileError, RoundOutcome, SaveData, ScoreConfig, SimConfig,
-    SimInput, Team, Tile, World, DEFAULT_TICK_HZ,
+    SimInput, SimSfx, Team, Tile, World, DEFAULT_TICK_HZ,
 };
 use std::path::PathBuf;
+use std::time::Duration;
 
 const TILE_PX: f32 = 32.0;
 /// Reserved space above the map so Playing HUD does not cover tiles.
@@ -65,7 +67,7 @@ fn main() {
                 menu_controls.run_if(in_state(Screen::Menu)),
                 high_scores_controls.run_if(in_state(Screen::HighScores)),
                 stage_controls.run_if(in_state(Screen::LevelIntro)),
-                (playing_controls, step_sim, sync_play)
+                (playing_controls, step_sim, play_sfx, sync_play)
                     .chain()
                     .run_if(in_state(Screen::Playing)),
                 update_overlay_text,
@@ -165,6 +167,10 @@ struct TankSprite {
     sim_id: u64,
 }
 
+/// Child barrel; rotated with the hull so facing stays readable.
+#[derive(Component)]
+struct TankBarrel;
+
 #[derive(Component)]
 struct BulletSprite {
     sim_id: u64,
@@ -191,18 +197,14 @@ fn make_world(levels: &Campaign, level: u32, carry: Option<PlayerProgress>) -> W
     let (map, wave) = levels
         .load(level)
         .unwrap_or_else(|e| panic!("load stage {level}: {e}"));
-    let score = ScoreConfig::parse(SCORE_CFG).expect("data/score.cfg");
+    let score = ScoreConfig::parse(SCORE_CFG).expect("data/score.cfg score keys");
+    let lives = LivesConfig::parse(SCORE_CFG).expect("data/score.cfg lives keys");
     let bonuses = BonusCatalog::parse(BONUS_CATALOG).expect("data/bonuses/catalog.cfg");
     let mut world = World::new(
         map,
         SimConfig {
             wave,
-            lives: LivesConfig {
-                starting_lives: 3,
-                max_lives: 5,
-                life_every_points: 200,
-                invuln_secs: 3.0,
-            },
+            lives,
             score,
             bonuses,
             ..Default::default()
@@ -279,13 +281,37 @@ fn spawn_tank_sprite(
     map_h: f32,
 ) {
     let (bx, by) = sim_to_bevy(x, y, map_w, map_h);
+    let look = TankLook::basic(team);
+    let barrel_y = look.barrel_offset();
     commands.spawn((
         Playfield,
         TankSprite { sim_id },
-        Sprite::from_color(team_color(team), Vec2::splat(TILE_PX * 0.8)),
+        Sprite::from_color(look.hull_color, look.hull),
         Transform::from_xyz(bx, by, 1.0),
         Visibility::Hidden,
+        Children::spawn(Spawn((
+            TankBarrel,
+            Sprite::from_color(look.barrel_color, look.barrel),
+            Transform::from_xyz(0.0, barrel_y, 0.1),
+        ))),
     ));
+}
+
+fn play_sfx(
+    mut sim: ResMut<SimWorld>,
+    mut pitches: ResMut<Assets<Pitch>>,
+    mut commands: Commands,
+) {
+    for cue in sim.0.sfx.drain(..) {
+        let (freq, ms) = match cue {
+            SimSfx::Shot => (740.0, 35),
+            SimSfx::Explosion => (95.0, 160),
+        };
+        commands.spawn((
+            AudioPlayer(pitches.add(Pitch::new(freq, Duration::from_millis(ms)))),
+            PlaybackSettings::DESPAWN,
+        ));
+    }
 }
 
 fn begin_level(
@@ -708,14 +734,27 @@ fn sync_play(
         (
             With<TileSprite>,
             Without<TankSprite>,
+            Without<TankBarrel>,
             Without<BonusSprite>,
             Without<BonusLetter>,
         ),
     >,
     mut tanks: Query<
-        (Entity, &TankSprite, &mut Transform, &mut Sprite),
+        (Entity, &TankSprite, &mut Transform, &mut Sprite, Option<&Children>),
         (
             With<TankSprite>,
+            Without<TileSprite>,
+            Without<BulletSprite>,
+            Without<BonusSprite>,
+            Without<BonusLetter>,
+            Without<TankBarrel>,
+        ),
+    >,
+    mut barrels: Query<
+        (&mut Sprite, &mut Transform),
+        (
+            With<TankBarrel>,
+            Without<TankSprite>,
             Without<TileSprite>,
             Without<BulletSprite>,
             Without<BonusSprite>,
@@ -727,6 +766,7 @@ fn sync_play(
         (
             With<BulletSprite>,
             Without<TankSprite>,
+            Without<TankBarrel>,
             Without<TileSprite>,
             Without<BonusSprite>,
             Without<BonusLetter>,
@@ -737,6 +777,7 @@ fn sync_play(
         (
             With<BonusSprite>,
             Without<TankSprite>,
+            Without<TankBarrel>,
             Without<TileSprite>,
             Without<BulletSprite>,
             Without<BonusLetter>,
@@ -748,6 +789,7 @@ fn sync_play(
             With<BonusLetter>,
             Without<BonusSprite>,
             Without<TankSprite>,
+            Without<TankBarrel>,
             Without<BulletSprite>,
             Without<TileSprite>,
             Without<HudLabel>,
@@ -788,7 +830,7 @@ fn sync_play(
         .collect();
 
     let mut seen_tanks = Vec::new();
-    for (entity, marker, mut tf, mut sprite) in &mut tanks {
+    for (entity, marker, mut tf, mut sprite, children) in &mut tanks {
         if let Some((_, team, x, y, dir, upgrade, armored, ship, carries, _inv)) = live_tanks
             .iter()
             .find(|(id, _, _, _, _, _, _, _, _, _)| *id == marker.sim_id)
@@ -797,35 +839,27 @@ fn sync_play(
             tf.translation.x = bx;
             tf.translation.y = by;
             tf.rotation = Quat::from_rotation_z(dir_angle(*dir));
-            let mut color = team_color(*team);
-            if *team == Team::Player && invuln {
-                color = if player_blink_on {
-                    Color::srgb(0.85, 1.0, 0.9)
-                } else {
-                    Color::srgba(0.2, 0.85, 0.35, 0.25)
-                };
-            } else if *team == Team::Enemy {
-                // Classic: bonus carrier blinks white/red.
-                if *carries {
-                    color = if blink_phase {
-                        Color::srgb(1.0, 1.0, 1.0)
-                    } else {
-                        Color::srgb(0.9, 0.25, 0.2)
-                    };
-                } else if *armored {
-                    // Tank 1990 life / helmet armor — green blink.
-                    color = if blink_phase {
-                        Color::srgb(0.35, 0.95, 0.4)
-                    } else {
-                        Color::srgb(0.15, 0.55, 0.2)
-                    };
-                } else if *upgrade > 0 {
-                    color = Color::srgb(0.95, 0.55, 0.15);
-                } else if *ship {
-                    color = Color::srgb(0.25, 0.65, 0.95);
+            let look = TankLook::from_state(
+                *team,
+                *upgrade,
+                *armored,
+                *ship,
+                *carries,
+                invuln && *team == Team::Player,
+                blink_phase,
+                player_blink_on,
+            );
+            sprite.color = look.hull_color;
+            sprite.custom_size = Some(look.hull);
+            if let Some(children) = children {
+                for child in children.iter() {
+                    if let Ok((mut barrel_sprite, mut barrel_tf)) = barrels.get_mut(child) {
+                        barrel_sprite.color = look.barrel_color;
+                        barrel_sprite.custom_size = Some(look.barrel);
+                        barrel_tf.translation.y = look.barrel_offset();
+                    }
                 }
             }
-            sprite.color = color;
             seen_tanks.push(marker.sim_id);
         } else {
             commands.entity(entity).despawn();
@@ -1175,6 +1209,119 @@ fn team_color(team: Team) -> Color {
     match team {
         Team::Player => Color::srgb(0.2, 0.85, 0.35),
         Team::Enemy => Color::srgb(0.9, 0.25, 0.2),
+    }
+}
+
+/// Readable tank silhouette: hull size/shape + barrel length/color by status.
+struct TankLook {
+    hull: Vec2,
+    barrel: Vec2,
+    hull_color: Color,
+    barrel_color: Color,
+}
+
+impl TankLook {
+    fn basic(team: Team) -> Self {
+        Self::from_state(team, 0, false, false, false, false, false, true)
+    }
+
+    fn from_state(
+        team: Team,
+        upgrade: u8,
+        armored: bool,
+        ship: bool,
+        carries: bool,
+        player_invuln: bool,
+        blink_phase: bool,
+        player_blink_on: bool,
+    ) -> Self {
+        // Base hull is slightly wider than tall so rotation alone also hints facing.
+        let mut hull = Vec2::new(TILE_PX * 0.78, TILE_PX * 0.62);
+        let mut barrel = Vec2::new(TILE_PX * 0.16, TILE_PX * 0.34);
+        let mut hull_color = team_color(team);
+        let mut barrel_color = Color::srgb(0.88, 0.88, 0.78);
+
+        if upgrade > 0 {
+            // Longer gun per star; ★3–4 a bit thicker.
+            let grow = upgrade as f32;
+            barrel.y = TILE_PX * (0.34 + 0.07 * grow);
+            barrel.x = TILE_PX * if upgrade >= 3 { 0.22 } else { 0.18 };
+            match team {
+                Team::Enemy => {
+                    hull_color = Color::srgb(0.95, 0.55, 0.15);
+                    barrel_color = Color::srgb(1.0, 0.85, 0.35);
+                }
+                Team::Player => {
+                    // Player keeps green body; gold barrel shows star power.
+                    hull_color = Color::srgb(0.25, 0.9, 0.4);
+                    barrel_color = Color::srgb(1.0, 0.9, 0.35);
+                    hull.x = TILE_PX * (0.78 + 0.03 * grow.min(3.0));
+                }
+            }
+        }
+
+        if armored {
+            // Heavier silhouette (Tank 1990 / enemy helmet armor).
+            hull = Vec2::new(TILE_PX * 0.92, TILE_PX * 0.78);
+            barrel.x = TILE_PX * 0.24;
+            if team == Team::Enemy {
+                hull_color = if blink_phase {
+                    Color::srgb(0.35, 0.95, 0.4)
+                } else {
+                    Color::srgb(0.15, 0.55, 0.2)
+                };
+                barrel_color = Color::srgb(0.55, 0.85, 0.45);
+            }
+        }
+
+        if ship {
+            // Wider “boat” body + cyan cue.
+            hull = Vec2::new(TILE_PX * 0.92, TILE_PX * 0.48);
+            match team {
+                Team::Enemy => {
+                    hull_color = Color::srgb(0.25, 0.65, 0.95);
+                    barrel_color = Color::srgb(0.7, 0.9, 1.0);
+                }
+                Team::Player => {
+                    hull_color = Color::srgb(0.2, 0.75, 0.7);
+                    barrel_color = Color::srgb(0.75, 0.95, 1.0);
+                }
+            }
+        }
+
+        if carries {
+            // Flashing carrier — keep blink, inflate slightly so it pops in a crowd.
+            hull *= 1.08;
+            hull_color = if blink_phase {
+                Color::srgb(1.0, 1.0, 1.0)
+            } else {
+                Color::srgb(0.9, 0.25, 0.2)
+            };
+            barrel_color = if blink_phase {
+                Color::srgb(1.0, 1.0, 0.85)
+            } else {
+                Color::srgb(0.95, 0.55, 0.45)
+            };
+        }
+
+        if player_invuln {
+            hull_color = if player_blink_on {
+                Color::srgb(0.85, 1.0, 0.9)
+            } else {
+                Color::srgba(0.2, 0.85, 0.35, 0.25)
+            };
+        }
+
+        Self {
+            hull,
+            barrel,
+            hull_color,
+            barrel_color,
+        }
+    }
+
+    fn barrel_offset(&self) -> f32 {
+        self.hull.y * 0.5 + self.barrel.y * 0.28
     }
 }
 

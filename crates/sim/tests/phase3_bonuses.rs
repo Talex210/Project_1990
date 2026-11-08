@@ -34,7 +34,7 @@ fn world_with_catalog(map: &str) -> World {
 #[test]
 fn shipped_catalog_parses_all_classic_letters() {
     let cat = BonusCatalog::parse(CATALOG).unwrap();
-    assert_eq!(cat.drop_every_kills, 1);
+    assert_eq!(cat.drop_every_kills, 4);
     for id in [
         "helmet", "clock", "shovel", "grenade", "star", "gun", "tank", "ship",
     ] {

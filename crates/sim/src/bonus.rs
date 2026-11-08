@@ -74,6 +74,8 @@ pub struct BonusDef {
     /// Cap for `TankUpgrade` stacks (`0` = use engine default 3).
     pub max_stacks: u32,
     pub exclusive_group: Option<String>,
+    /// Relative drop chance (higher = more common). `0` treated as `1` when picking.
+    pub weight: u32,
 }
 
 impl BonusDef {
@@ -112,6 +114,28 @@ impl BonusCatalog {
             return None;
         }
         self.defs.get(index % self.defs.len())
+    }
+
+    /// Weighted random pick. `roll` is any mix from sim state (LCG / salt).
+    /// Higher `weight` → more common; missing/zero weights act as `1`.
+    pub fn pick_weighted(&self, roll: u64) -> Option<&BonusDef> {
+        if self.defs.is_empty() {
+            return None;
+        }
+        let total: u64 = self
+            .defs
+            .iter()
+            .map(|d| d.weight.max(1) as u64)
+            .sum();
+        let mut r = roll % total.max(1);
+        for def in &self.defs {
+            let w = def.weight.max(1) as u64;
+            if r < w {
+                return Some(def);
+            }
+            r -= w;
+        }
+        self.defs.last()
     }
 
     /// Parse catalog text (`[id]` sections + top-level keys).
@@ -187,6 +211,7 @@ struct BonusDefBuilder {
     score: u32,
     max_stacks: u32,
     exclusive_group: Option<String>,
+    weight: u32,
 }
 
 impl BonusDefBuilder {
@@ -202,6 +227,7 @@ impl BonusDefBuilder {
             score: 0,
             max_stacks: 0,
             exclusive_group: None,
+            weight: 1,
         }
     }
 
@@ -288,6 +314,9 @@ impl BonusDefBuilder {
                     Some(val.to_string())
                 };
             }
+            "weight" => {
+                self.weight = parse_u32(val, line, key)?.max(1);
+            }
             other => {
                 return Err(BonusParseError::UnknownKey {
                     line,
@@ -323,6 +352,7 @@ impl BonusDefBuilder {
             score: self.score,
             max_stacks: self.max_stacks,
             exclusive_group: self.exclusive_group,
+            weight: self.weight.max(1),
         })
     }
 }
@@ -447,8 +477,8 @@ pub struct BonusState {
     pub pickups: Vec<BonusPickup>,
     pub active: Vec<ActiveBonus>,
     pub kills_since_drop: u32,
-    /// Round-robin index into catalog for which letter drops next.
-    pub next_drop_index: usize,
+    /// Salt bumped each catalog drop so weighted picks stay varied without an RNG crate.
+    pub drop_salt: u64,
     /// Seconds opponents stay frozen (`Team` = who is frozen).
     pub freeze_player_secs: f32,
     pub freeze_enemy_secs: f32,
@@ -469,7 +499,7 @@ impl BonusState {
             pickups: Vec::new(),
             active: Vec::new(),
             kills_since_drop: 0,
-            next_drop_index: 0,
+            drop_salt: 0,
             freeze_player_secs: 0.0,
             freeze_enemy_secs: 0.0,
             freeze_player_by_enemy: None,
@@ -664,6 +694,7 @@ effects=TankUpgrade
 cancel=death
 score=500
 max_stacks=3
+weight=9
 "#;
 
     #[test]
@@ -678,8 +709,26 @@ max_stacks=3
         assert_eq!(h.effects, vec![EffectKind::Invuln]);
         assert!(h.cancel.on_death);
         assert_eq!(h.exclusive_group.as_deref(), Some("protect"));
+        assert_eq!(h.weight, 1); // default when omitted
         let s = cat.get("star").unwrap();
         assert_eq!(s.max_stacks, 3);
+        assert_eq!(s.weight, 9);
+    }
+
+    #[test]
+    fn pick_weighted_respects_relative_weights() {
+        let cat = BonusCatalog::parse(SAMPLE).unwrap();
+        // helmet weight 1, star weight 9 → star should dominate over many rolls.
+        let mut star = 0u32;
+        let mut helmet = 0u32;
+        for i in 0..1000u64 {
+            match cat.pick_weighted(i * 7919).unwrap().id.as_str() {
+                "star" => star += 1,
+                "helmet" => helmet += 1,
+                other => panic!("unexpected {other}"),
+            }
+        }
+        assert!(star > helmet * 3, "star={star} helmet={helmet}");
     }
 
     #[test]

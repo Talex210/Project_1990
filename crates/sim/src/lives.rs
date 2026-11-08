@@ -1,6 +1,8 @@
 //! Player lives, score thresholds → extra life, invulnerability after respawn.
 
-/// Data-driven lives / score-life rules (see `docs/SCORE.md`).
+use std::fmt;
+
+/// Data-driven lives / score-life rules (see `docs/SCORE.md`, `data/score.cfg`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LivesConfig {
     pub starting_lives: u32,
@@ -16,12 +18,98 @@ impl Default for LivesConfig {
     fn default() -> Self {
         Self {
             starting_lives: 3,
-            max_lives: 5,
+            max_lives: 9,
             life_every_points: 20_000,
             invuln_secs: 3.0,
         }
     }
 }
+
+impl LivesConfig {
+    /// Parse lives keys from `data/score.cfg` (score keys are ignored).
+    pub fn parse(text: &str) -> Result<Self, LivesParseError> {
+        let mut cfg = Self::default();
+        for (line_no, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (key, val) = line
+                .split_once('=')
+                .ok_or(LivesParseError::BadLine { line: line_no + 1 })?;
+            let key = key.trim();
+            let val = val.trim();
+            match key {
+                "starting_lives" => {
+                    cfg.starting_lives = parse_u32(val, line_no + 1, key)?;
+                }
+                "max_lives" => {
+                    cfg.max_lives = parse_u32(val, line_no + 1, key)?;
+                }
+                "life_every_points" => {
+                    cfg.life_every_points = parse_u32(val, line_no + 1, key)?;
+                }
+                "invuln_secs" => {
+                    cfg.invuln_secs = parse_f32(val, line_no + 1, key)?.max(0.0);
+                }
+                // Shared file with ScoreConfig — ignore point table keys.
+                "enemy_basic"
+                | "enemy_armor"
+                | "enemy_boss"
+                | "streak_bonus_per_step"
+                | "clear_bonus"
+                | "clear_no_death_bonus"
+                | "clear_base_safe_bonus" => {}
+                other => {
+                    return Err(LivesParseError::UnknownKey {
+                        line: line_no + 1,
+                        key: other.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(cfg)
+    }
+}
+
+fn parse_u32(val: &str, line: usize, key: &str) -> Result<u32, LivesParseError> {
+    val.parse().map_err(|_| LivesParseError::BadValue {
+        line,
+        key: key.to_string(),
+    })
+}
+
+fn parse_f32(val: &str, line: usize, key: &str) -> Result<f32, LivesParseError> {
+    val.parse().map_err(|_| LivesParseError::BadValue {
+        line,
+        key: key.to_string(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LivesParseError {
+    BadLine { line: usize },
+    BadValue { line: usize, key: String },
+    UnknownKey { line: usize, key: String },
+}
+
+impl fmt::Display for LivesParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LivesParseError::BadLine { line } => {
+                write!(f, "score.cfg lives line {line}: expected key=value")
+            }
+            LivesParseError::BadValue { line, key } => {
+                write!(f, "score.cfg lives line {line}: bad value for {key}")
+            }
+            LivesParseError::UnknownKey { line, key } => {
+                write!(f, "score.cfg lives line {line}: unknown key {key}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LivesParseError {}
 
 /// Runtime player progress for the current run.
 #[derive(Debug, Clone, PartialEq)]
@@ -146,5 +234,14 @@ mod tests {
         });
         assert_eq!(p.add_score(200), 1);
         assert_eq!(p.lives, 5);
+    }
+
+    #[test]
+    fn shipped_score_cfg_lives_are_classic_scale() {
+        let cfg = LivesConfig::parse(include_str!("../../../data/score.cfg")).unwrap();
+        assert_eq!(cfg.starting_lives, 3);
+        assert_eq!(cfg.max_lives, 9);
+        assert_eq!(cfg.life_every_points, 20_000);
+        assert!((cfg.invuln_secs - 3.0).abs() < f32::EPSILON);
     }
 }
