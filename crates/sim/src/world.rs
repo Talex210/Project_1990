@@ -630,7 +630,6 @@ impl World {
                 let carries = self.tanks[pos].carries_bonus;
                 let (dx, dy) = (self.tanks[pos].x, self.tanks[pos].y);
                 self.bonuses.cancel_on_death(team, tid);
-                self.bonuses.clear_enemy_clock_if(tid);
                 self.tanks.swap_remove(pos);
                 self.bullets.retain(|b| b.owner_id != tid);
                 self.sfx.push(SimSfx::Explosion);
@@ -655,6 +654,7 @@ impl World {
         }
 
         if player_died {
+            self.bonuses.clear_clocks_on_player_death();
             self.style.on_player_death();
             if self.progress.on_tank_destroyed() {
                 self.spawn_player_tank();
@@ -1075,8 +1075,8 @@ impl World {
                             self.bonuses.freeze_enemy_secs.max(def.duration_secs);
                     }
                     Team::Enemy => {
-                        // Timed freeze: player can shoot, cannot move.
-                        self.bonuses.freeze_player_by_enemy = None;
+                        // Timed freeze until duration ends, carrier dies, or player dies.
+                        self.bonuses.freeze_player_by_enemy = Some(tank_id);
                         self.bonuses.freeze_player_secs =
                             self.bonuses.freeze_player_secs.max(def.duration_secs);
                     }
@@ -1110,7 +1110,6 @@ impl World {
                         self.bullets.retain(|b| b.owner_id != vid);
                         self.sfx.push(SimSfx::Explosion);
                         if vteam == Team::Enemy {
-                            self.bonuses.clear_enemy_clock_if(vid);
                             self.wave.on_destroyed();
                             if team == Team::Player {
                                 let (pts, _) = self.style.award_kill(&self.config.score, kind);
@@ -1120,6 +1119,7 @@ impl World {
                                 drops.push((dx, dy));
                             }
                         } else if vteam == Team::Player {
+                            self.bonuses.clear_clocks_on_player_death();
                             self.style.on_player_death();
                             if self.progress.on_tank_destroyed() {
                                 self.spawn_player_tank();
@@ -1488,32 +1488,72 @@ impl World {
                 (None, pref) => pref,
             };
 
-            // 2) Dodge only a close incoming player bullet.
-            if commit_ok.is_none() {
-                if let Some(d) = self.dodge_incoming_bullet(eid, ex, ey, water_walk, slot) {
-                    action = Some(SeekAction::Move(d));
+            // 2) Threat reaction may interrupt a Move commit (side shots were free kills).
+            let mut under_threat = false;
+            if let Some(d) = self.dodge_incoming_bullet(eid, ex, ey, water_walk, slot) {
+                action = Some(SeekAction::Move(d));
+                under_threat = true;
+            } else if let Some((px, py, pdir)) = player {
+                if self.player_aims_at(ex, ey, player) {
+                    under_threat = true;
+                    if let Some(d) = self.strafe_dir(eid, ex, ey, water_walk, pdir, slot) {
+                        action = Some(SeekAction::Move(d));
+                    } else if let Some(face) = Self::dir_toward(ex, ey, px, py) {
+                        // Can't sidestep — turn and return fire instead of eating the shot.
+                        action = Some(SeekAction::Shoot(face));
+                    }
                 }
             }
 
-            // 3) Brief brick fire when idle/blocked toward goal.
+            // 3) Corridor / corner breakout.
+            let prefer = Self::dir_toward(ex, ey, aim_x, aim_y);
+            let open = self.open_move_dirs(eid, ex, ey, water_walk);
+            let narrow_corridor = open.len() == 2
+                && Self::dirs_are_opposite(open[0], open[1])
+                && self.dead_end_brick_dir(ex, ey, prefer, &open).is_some();
+            // Don't cancel a live threat reaction for corridor logic.
+            if !under_threat && commit_ok.is_none() && open.len() == 1 {
+                action = Some(SeekAction::Move(open[0]));
+            } else if !under_threat && narrow_corridor {
+                // Opposite opens only (up/down or left/right): blast side bricks,
+                // even over a Move commit (that caused up/down twitch).
+                if let Some(d) = self.dead_end_brick_dir(ex, ey, prefer, &open) {
+                    action = Some(SeekAction::Shoot(d));
+                }
+            } else if !under_threat
+                && commit_ok.is_none()
+                && (action.is_none() || stuck_secs >= STUCK_UNSTICK_SECS)
+            {
+                if let Some(d) = self.dead_end_brick_dir(ex, ey, prefer, &open) {
+                    action = Some(SeekAction::Shoot(d));
+                }
+            }
+
+            // 4) Brief brick fire toward goal when soft-blocked.
             if action.is_none() {
-                if let Some(d) = Self::dir_toward(ex, ey, aim_x, aim_y) {
+                if let Some(d) = prefer {
                     if self.tile_ahead_is_brick(ex, ey, d) && stuck_secs < STUCK_SHOOT_MAX_SECS {
                         action = Some(SeekAction::Shoot(d));
                     }
                 }
             }
 
-            // 4) Stable unstick when wedged.
-            if commit_ok.is_none()
-                && (stuck_secs >= STUCK_UNSTICK_SECS
-                    || action.is_none()
-                    || (matches!(action, Some(SeekAction::Shoot(_)))
-                        && stuck_secs >= STUCK_SHOOT_MAX_SECS))
+            // 5) Unstick — but never cancel a live brick-break shot (that caused up/down twitch).
+            let shooting_brick = match action {
+                Some(SeekAction::Shoot(d)) if self.tile_ahead_is_brick(ex, ey, d) => true,
+                _ => false,
+            };
+            if !under_threat
+                && !shooting_brick
+                && commit_ok.is_none()
+                && (stuck_secs >= STUCK_UNSTICK_SECS || action.is_none())
             {
-                let prefer = Self::dir_toward(ex, ey, aim_x, aim_y);
                 if let Some(d) = self.unstick_dir(eid, ex, ey, water_walk, slot, prefer) {
                     action = Some(SeekAction::Move(d));
+                } else if let Some(d) = self.dead_end_brick_dir(ex, ey, prefer, &open) {
+                    action = Some(SeekAction::Shoot(d));
+                } else if open.len() == 1 {
+                    action = Some(SeekAction::Move(open[0]));
                 }
             }
 
@@ -1559,6 +1599,121 @@ impl World {
         self.map.in_bounds(bx, by) && self.map.get(bx as u32, by as u32) == Some(Tile::Brick)
     }
 
+    fn open_move_dirs(&self, tank_id: u64, x: f32, y: f32, water_walk: bool) -> Vec<Dir> {
+        let half = self.config.tank_half;
+        let probe = half.max(0.25);
+        let mut out = Vec::with_capacity(4);
+        for dir in [Dir::Up, Dir::Down, Dir::Left, Dir::Right] {
+            let (dx, dy) = dir.delta();
+            let nx = x + dx * probe;
+            let ny = y + dy * probe;
+            if self.can_tank_move(tank_id, nx, ny, half, water_walk) {
+                out.push(dir);
+            }
+        }
+        out
+    }
+
+    fn dirs_are_opposite(a: Dir, b: Dir) -> bool {
+        matches!(
+            (a, b),
+            (Dir::Up, Dir::Down)
+                | (Dir::Down, Dir::Up)
+                | (Dir::Left, Dir::Right)
+                | (Dir::Right, Dir::Left)
+        )
+    }
+
+    /// In a tight corridor/corner: face a brick we can destroy to open a lane.
+    fn dead_end_brick_dir(
+        &self,
+        x: f32,
+        y: f32,
+        prefer: Option<Dir>,
+        open: &[Dir],
+    ) -> Option<Dir> {
+        if open.len() > 2 {
+            return None;
+        }
+        let mut bricks = Vec::with_capacity(4);
+        for dir in [Dir::Up, Dir::Down, Dir::Left, Dir::Right] {
+            if self.tile_ahead_is_brick(x, y, dir) {
+                bricks.push(dir);
+            }
+        }
+        if bricks.is_empty() {
+            return None;
+        }
+        if open.len() <= 1 {
+            // Dead-end pocket: prefer blasting toward the goal, else any brick.
+            if let Some(p) = prefer {
+                if bricks.contains(&p) {
+                    return Some(p);
+                }
+            }
+            return Some(bricks[0]);
+        }
+        // True corridor: two opposite opens and brick on *both* flanks.
+        // (One flank brick + map edge is a wall abut — go around, don't sit shooting.)
+        if open.len() == 2 && Self::dirs_are_opposite(open[0], open[1]) {
+            let flanks: Vec<Dir> = [Dir::Up, Dir::Down, Dir::Left, Dir::Right]
+                .into_iter()
+                .filter(|d| *d != open[0] && *d != open[1])
+                .collect();
+            if flanks.len() != 2 {
+                return None;
+            }
+            if !bricks.contains(&flanks[0]) || !bricks.contains(&flanks[1]) {
+                return None;
+            }
+            if let Some(p) = prefer {
+                if p == flanks[0] || p == flanks[1] {
+                    return Some(p);
+                }
+            }
+            return Some(flanks[0]);
+        }
+        None
+    }
+
+    fn player_aims_at(&self, ex: f32, ey: f32, player: Option<(f32, f32, Dir)>) -> bool {
+        let Some((px, py, pdir)) = player else {
+            return false;
+        };
+        let dist = (px - ex).hypot(py - ey);
+        if dist > 8.0 || dist < 0.35 {
+            return false;
+        }
+        ai::aims_at(pdir, px, py, ex, ey)
+    }
+
+    /// Side-step away from the player's aim corridor (gentle dodge).
+    fn strafe_dir(
+        &self,
+        tank_id: u64,
+        x: f32,
+        y: f32,
+        water_walk: bool,
+        threat_dir: Dir,
+        slot: u32,
+    ) -> Option<Dir> {
+        let half = self.config.tank_half;
+        let probe = half.max(0.25);
+        let mut dirs = ai::strafe_dirs(threat_dir);
+        if slot % 2 == 1 {
+            dirs.swap(0, 1);
+        }
+        for dir in dirs {
+            let (dx, dy) = dir.delta();
+            let nx = x + dx * probe;
+            let ny = y + dy * probe;
+            if self.can_tank_move(tank_id, nx, ny, half, water_walk) {
+                return Some(dir);
+            }
+        }
+        None
+    }
+
     /// Side-step only when a player bullet is close and roughly aimed at us.
     fn dodge_incoming_bullet(
         &self,
@@ -1576,7 +1731,8 @@ impl World {
                 continue;
             }
             let dist = (b.x - x).hypot(b.y - y);
-            if dist > 2.2 || dist < 0.15 {
+            // Far enough to react to side shots before they land.
+            if dist > 4.0 || dist < 0.15 {
                 continue;
             }
             // Bullet roughly heading toward our cell.
@@ -1588,7 +1744,7 @@ impl World {
                 continue;
             }
             let cross = (dx * to_us_y - dy * to_us_x).abs();
-            if cross > 0.7 {
+            if cross > 0.85 {
                 continue;
             }
             let dirs = ai::strafe_dirs(b.dir);

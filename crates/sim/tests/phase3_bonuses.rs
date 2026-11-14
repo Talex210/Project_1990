@@ -614,7 +614,13 @@ X....
         p.fire.autofire = true;
         p.fire.cooldown = 0.0;
     }
-    for _ in 0..50 {
+    for _ in 0..80 {
+        // Pin the target — this test checks drop rules, not dodge.
+        if let Some(e) = world.tanks.iter_mut().find(|t| t.id == 77) {
+            e.x = 0.5;
+            e.y = 0.5;
+            e.move_dir = None;
+        }
         world.step(
             &SimInput {
                 fire_held: true,
@@ -669,6 +675,10 @@ X....
     });
     world.spawn_pickup_at("helmet", 3.5, 1.5).unwrap();
     for _ in 0..120 {
+        {
+            let p = world.player_mut().unwrap();
+            p.dir = Dir::Down; // don't steal the bonus path with aim-strafe
+        }
         world.step(&SimInput::default(), 1.0 / 60.0);
         if world.bonuses.pickups.is_empty() {
             break;
@@ -720,7 +730,15 @@ X#..
             ai_commit_cell: None,
     });
     world.spawn_pickup_at("helmet", 3.5, 0.5).unwrap();
+    {
+        let p = world.player_mut().unwrap();
+        p.dir = Dir::Down;
+    }
     for _ in 0..400 {
+        {
+            let p = world.player_mut().unwrap();
+            p.dir = Dir::Down;
+        }
         world.step(&SimInput::default(), 1.0 / 60.0);
         if world.bonuses.pickups.is_empty() {
             break;
@@ -811,6 +829,111 @@ X....
         p.fire.cooldown = 0.0;
         assert!(p.fire.try_fire(0), "frozen player must still shoot");
     }
+}
+
+#[test]
+fn enemy_clock_survives_carrier_death() {
+    let mut world = world_with_catalog(
+        "\
+.....
+X....
+..P..
+",
+    );
+    world.tanks.push(project1990_sim::Tank {
+        id: 91,
+        team: Team::Enemy,
+        enemy_kind: Default::default(),
+        x: 0.5,
+        y: 1.5,
+        dir: Dir::Down,
+        fire: project1990_sim::FireController::new(world.config.enemy_fire),
+        move_dir: None,
+        mods: Default::default(),
+        carries_bonus: false,
+        ai_goal: None,
+        ai_stuck_secs: 0.0,
+        ai_prev_x: 0.0,
+        ai_prev_y: 0.0,
+        ai_commit_dir: None,
+        ai_commit_left: 0.0,
+        ai_commit_cell: None,
+    });
+    world.spawn_pickup_at("clock", 0.5, 1.5).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    let frozen = world.bonuses.freeze_player_secs;
+    assert!(frozen > 0.0);
+
+    // Kill the carrier — freeze must keep ticking.
+    world.tanks.retain(|t| t.id != 91);
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert!(
+        world.bonuses.freeze_player_secs > 0.0,
+        "killing the clock carrier must not clear the freeze"
+    );
+    assert!(world.bonuses.opponents_frozen(Team::Player));
+}
+
+#[test]
+fn enemy_clock_clears_when_player_dies() {
+    let mut world = world_with_catalog(
+        "\
+.....
+X....
+..P..
+",
+    );
+    world.tanks.push(project1990_sim::Tank {
+        id: 92,
+        team: Team::Enemy,
+        enemy_kind: Default::default(),
+        x: 0.5,
+        y: 1.5,
+        dir: Dir::Down,
+        fire: project1990_sim::FireController::new(world.config.enemy_fire),
+        move_dir: None,
+        mods: Default::default(),
+        carries_bonus: false,
+        ai_goal: None,
+        ai_stuck_secs: 0.0,
+        ai_prev_x: 0.0,
+        ai_prev_y: 0.0,
+        ai_commit_dir: None,
+        ai_commit_left: 0.0,
+        ai_commit_cell: None,
+    });
+    world.spawn_pickup_at("clock", 0.5, 1.5).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert!(world.bonuses.freeze_player_secs > 0.0);
+    assert_eq!(world.bonuses.freeze_player_by_enemy, Some(92));
+
+    // Kill the player with an enemy bullet while frozen.
+    world.progress.invuln_remaining = 0.0;
+    if let Some(p) = world.player_mut() {
+        p.mods.invuln = false;
+        p.mods.armored = false;
+        p.mods.upgrade = 0;
+    }
+    let (px, py) = {
+        let p = world.player().unwrap();
+        (p.x, p.y)
+    };
+    world.bullets.push(project1990_sim::Bullet {
+        id: 9001,
+        owner_id: 92,
+        team: Team::Enemy,
+        x: px,
+        y: py,
+        dir: Dir::Down,
+        speed: 6.0,
+    });
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert_eq!(
+        world.bonuses.freeze_player_secs, 0.0,
+        "player death must clear enemy clock freeze"
+    );
+    assert!(world.bonuses.freeze_player_by_enemy.is_none());
+    assert!(!world.bonuses.opponents_frozen(Team::Player));
 }
 
 #[test]

@@ -543,10 +543,12 @@ impl BonusState {
         }
     }
 
-    pub fn clear_enemy_clock_if(&mut self, enemy_id: u64) {
-        if self.freeze_player_by_enemy == Some(enemy_id) {
-            self.freeze_player_by_enemy = None;
-        }
+    /// Player/ally died → any active clock freeze ends.
+    /// (Enemy carrier death does *not* clear the freeze — timer runs out normally.)
+    pub fn clear_clocks_on_player_death(&mut self) {
+        self.freeze_player_secs = 0.0;
+        self.freeze_player_by_enemy = None;
+        self.freeze_enemy_secs = 0.0;
     }
 
     pub fn hud_letters(&self, team: Team, tank_id: Option<u64>) -> String {

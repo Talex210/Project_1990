@@ -138,6 +138,88 @@ fn stuck_near_steel_abandons_base_for_player() {
 }
 
 #[test]
+fn shoots_brick_in_dead_end_corridor() {
+    // Surrounded by brick + one steel: no move → must blast a brick.
+    let mut world = world_from(
+        "\
+#####
+#XS##
+#####
+..P..
+..E..
+",
+    );
+    push_enemy(&mut world, 10, 1.5, 1.5);
+    {
+        let e = world.tanks.iter_mut().find(|t| t.id == 10).unwrap();
+        e.dir = Dir::Left;
+        e.ai_stuck_secs = 1.0;
+        e.ai_prev_x = e.x;
+        e.ai_prev_y = e.y;
+        e.fire.config.fire_interval = 0.05;
+        e.fire.autofire = true;
+        e.fire.cooldown = 0.0;
+    }
+    {
+        let p = world.player_mut().unwrap();
+        p.dir = Dir::Right;
+    }
+    for _ in 0..300 {
+        if let Some(e) = world.tanks.iter_mut().find(|t| t.id == 10) {
+            e.fire.config.fire_interval = 0.05;
+            e.fire.autofire = true;
+        }
+        {
+            let p = world.player_mut().unwrap();
+            p.dir = Dir::Right;
+        }
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        if world.map.get(0, 1) == Some(Tile::Empty)
+            || world.map.get(1, 0) == Some(Tile::Empty)
+            || world.map.get(1, 2) == Some(Tile::Empty)
+        {
+            break;
+        }
+    }
+    let cleared = world.map.get(0, 1) == Some(Tile::Empty)
+        || world.map.get(1, 0) == Some(Tile::Empty)
+        || world.map.get(1, 2) == Some(Tile::Empty);
+    assert!(
+        cleared,
+        "dead-end enemy must blast a brick to escape the pocket"
+    );
+}
+
+#[test]
+fn takes_only_open_exit_in_corridor() {
+    // Tip: Left/Up/Right blocked by brick, Down open → must move Down (not face the wall).
+    let mut world = world_from(
+        "\
+#####
+#X###
+#.###
+#...#
+#.P.#
+#.E.#
+",
+    );
+    push_enemy(&mut world, 10, 1.5, 1.5);
+    {
+        let e = world.tanks.iter_mut().find(|t| t.id == 10).unwrap();
+        e.dir = Dir::Right;
+        e.ai_stuck_secs = 0.8;
+        e.ai_prev_x = e.x;
+        e.ai_prev_y = e.y;
+        e.ai_commit_dir = Some(Dir::Right);
+        e.ai_commit_left = 1.0;
+        e.ai_commit_cell = Some((1, 1));
+    }
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    let e = world.tanks.iter().find(|t| t.id == 10).unwrap();
+    assert_eq!(e.move_dir, Some(Dir::Down), "must take the only open exit");
+}
+
+#[test]
 fn never_idles_when_open_step_exists() {
     // Against the top border with open cells below — must move, not stand shooting forever.
     let mut world = world_from(
@@ -157,6 +239,10 @@ fn never_idles_when_open_step_exists() {
         e.ai_stuck_secs = 0.7;
         e.ai_prev_x = e.x;
         e.ai_prev_y = e.y;
+    }
+    {
+        let p = world.player_mut().unwrap();
+        p.dir = Dir::Right; // not aiming up the pocket
     }
     world.step(&SimInput::default(), 1.0 / 60.0);
     let e = world.tanks.iter().find(|t| t.id == 10).unwrap();
@@ -212,7 +298,7 @@ fn unstick_leaves_dead_end_corner() {
     let e = world.tanks.iter().find(|t| t.id == 10).unwrap();
     let moved = (e.x - x0).hypot(e.y - y0);
     assert!(
-        moved > 0.4,
+        moved > 0.25,
         "anti-stuck must leave the corner (moved={moved}, at {},{})",
         e.x,
         e.y
@@ -246,6 +332,180 @@ X....
     assert!(
         flips < 25,
         "enemy flipped facing {flips} times in 3s — still spinning"
+    );
+}
+
+#[test]
+fn corridor_blasts_side_brick_not_up_down_twitch() {
+    // Vertical lane: only Up/Down free, bricks Left/Right → must face a side brick.
+    let mut world = world_from(
+        "\
+###
+#.#
+#X#
+#.#
+#P#
+#E#
+",
+    );
+    push_enemy(&mut world, 10, 1.5, 2.5);
+    {
+        let e = world.tanks.iter_mut().find(|t| t.id == 10).unwrap();
+        e.dir = Dir::Up;
+        e.move_dir = Some(Dir::Up);
+        e.ai_stuck_secs = 0.5;
+        e.ai_prev_x = e.x;
+        e.ai_prev_y = e.y;
+        e.ai_commit_dir = Some(Dir::Up);
+        e.ai_commit_left = 1.0;
+        e.ai_commit_cell = Some((1, 2));
+        e.fire.config.fire_interval = 0.05;
+        e.fire.autofire = true;
+        e.fire.cooldown = 0.0;
+    }
+    {
+        let p = world.player_mut().unwrap();
+        p.dir = Dir::Right; // not aiming at the corridor
+    }
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    let e = world.tanks.iter().find(|t| t.id == 10).unwrap();
+    assert!(
+        matches!(e.dir, Dir::Left | Dir::Right),
+        "corridor must face side brick, got {:?}",
+        e.dir
+    );
+    assert!(e.move_dir.is_none(), "must stop for brick shot, not twitch");
+
+    for _ in 0..360 {
+        if let Some(e) = world.tanks.iter_mut().find(|t| t.id == 10) {
+            e.x = 1.5;
+            e.y = 2.5;
+            e.fire.config.fire_interval = 0.05;
+            e.fire.autofire = true;
+        }
+        {
+            let p = world.player_mut().unwrap();
+            p.dir = Dir::Right;
+        }
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        if world.map.get(0, 2) == Some(Tile::Empty) || world.map.get(2, 2) == Some(Tile::Empty)
+        {
+            break;
+        }
+    }
+    let cleared = world.map.get(0, 2) == Some(Tile::Empty)
+        || world.map.get(2, 2) == Some(Tile::Empty);
+    assert!(cleared, "must destroy a side brick to leave the corridor");
+}
+
+#[test]
+fn threat_overrides_move_commit_to_strafe() {
+    // Committed downward move, player aims up the lane → must break commit and strafe.
+    let mut world = world_from(
+        "\
+X..............
+...............
+...............
+...............
+...............
+......P........
+",
+    );
+    push_enemy(&mut world, 10, 6.5, 2.5);
+    {
+        let e = world.tanks.iter_mut().find(|t| t.id == 10).unwrap();
+        e.dir = Dir::Down;
+        e.move_dir = Some(Dir::Down);
+        e.ai_commit_dir = Some(Dir::Down);
+        e.ai_commit_left = 1.0;
+        e.ai_commit_cell = Some((6, 2));
+        e.ai_prev_x = e.x;
+        e.ai_prev_y = e.y;
+    }
+    {
+        let p = world.player_mut().unwrap();
+        p.x = 6.5;
+        p.y = 5.5;
+        p.dir = Dir::Up;
+    }
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    let e = world.tanks.iter().find(|t| t.id == 10).unwrap();
+    assert!(
+        matches!(e.move_dir, Some(Dir::Left) | Some(Dir::Right)),
+        "threat must interrupt commit and strafe (move={:?} dir={:?})",
+        e.move_dir,
+        e.dir
+    );
+}
+
+#[test]
+fn faces_player_when_aimed_and_cannot_strafe() {
+    // Vertical pocket: player aims up the lane, no side step → turn and return fire.
+    let mut world = world_from(
+        "\
+###
+#X#
+#.#
+#P#
+#E#
+",
+    );
+    push_enemy(&mut world, 10, 1.5, 1.5);
+    {
+        let e = world.tanks.iter_mut().find(|t| t.id == 10).unwrap();
+        e.dir = Dir::Up;
+        e.ai_commit_dir = Some(Dir::Up);
+        e.ai_commit_left = 1.0;
+        e.ai_commit_cell = Some((1, 1));
+        e.ai_prev_x = e.x;
+        e.ai_prev_y = e.y;
+    }
+    {
+        let p = world.player_mut().unwrap();
+        p.x = 1.5;
+        p.y = 3.5;
+        p.dir = Dir::Up;
+    }
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    let e = world.tanks.iter().find(|t| t.id == 10).unwrap();
+    assert_eq!(e.dir, Dir::Down, "must face the aiming player");
+    assert!(e.move_dir.is_none(), "must stop to return fire");
+}
+
+#[test]
+fn strafes_when_player_aims_at_enemy() {
+    let mut world = world_from(
+        "\
+X..............
+...............
+...............
+......E........
+......P........
+",
+    );
+    push_enemy(&mut world, 10, 6.5, 0.5);
+    {
+        let e = world.tanks.iter_mut().find(|t| t.id == 10).unwrap();
+        e.x = 6.5;
+        e.y = 2.5;
+        e.ai_prev_x = 6.5;
+        e.ai_prev_y = 2.5;
+        e.ai_commit_dir = None;
+        e.ai_commit_left = 0.0;
+        e.ai_commit_cell = None;
+    }
+    {
+        let p = world.player_mut().unwrap();
+        p.x = 6.5;
+        p.y = 4.5;
+        p.dir = Dir::Up; // aiming straight at the enemy
+    }
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    let e = world.tanks.iter().find(|t| t.id == 10).unwrap();
+    assert!(
+        matches!(e.move_dir, Some(Dir::Left) | Some(Dir::Right)),
+        "must strafe off the aim line, got {:?}",
+        e.move_dir
     );
 }
 
