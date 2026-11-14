@@ -241,6 +241,7 @@ fn enemy_tank_letter_armors_all_enemies() {
         move_dir: None,
         mods: Default::default(),
         carries_bonus: false,
+        ai_goal: None,
     });
     world.tanks.push(project1990_sim::Tank {
         id: 71,
@@ -253,6 +254,7 @@ fn enemy_tank_letter_armors_all_enemies() {
         move_dir: None,
         mods: Default::default(),
         carries_bonus: false,
+        ai_goal: None,
     });
     world.spawn_pickup_at("tank", 0.5, 0.5).unwrap();
     world.step(&SimInput::default(), 1.0 / 60.0);
@@ -287,6 +289,7 @@ fn shovel_fortify_ejects_tank_standing_in_ring() {
         move_dir: None,
         mods: Default::default(),
         carries_bonus: false,
+        ai_goal: None,
     });
     let (px, py) = {
         let p = world.player().unwrap();
@@ -346,6 +349,7 @@ X....
             move_dir: Some(Dir::Down),
             mods: Default::default(),
         carries_bonus: false,
+        ai_goal: None,
         });
         id
     });
@@ -567,6 +571,7 @@ X....
         move_dir: None,
         mods: Default::default(),
         carries_bonus: true,
+        ai_goal: None,
     });
     world.wave.on_spawned();
 
@@ -624,6 +629,7 @@ X....
         move_dir: None,
         mods: Default::default(),
     carries_bonus: false,
+        ai_goal: None,
     });
     world.spawn_pickup_at("helmet", 3.5, 1.5).unwrap();
     for _ in 0..120 {
@@ -669,6 +675,7 @@ X#..
         move_dir: None,
         mods: Default::default(),
         carries_bonus: false,
+        ai_goal: None,
     });
     world.spawn_pickup_at("helmet", 3.5, 0.5).unwrap();
     for _ in 0..400 {
@@ -706,6 +713,7 @@ fn enemy_shovel_weakens_base_walls() {
         move_dir: None,
         mods: Default::default(),
     carries_bonus: false,
+        ai_goal: None,
     });
     world.spawn_pickup_at("shovel", 0.5, 0.5).unwrap();
     world.step(&SimInput::default(), 1.0 / 60.0);
@@ -736,6 +744,7 @@ X....
         move_dir: None,
         mods: Default::default(),
     carries_bonus: false,
+        ai_goal: None,
     });
     world.spawn_pickup_at("clock", 0.5, 1.5).unwrap();
     world.step(&SimInput::default(), 1.0 / 60.0);
@@ -773,6 +782,7 @@ X....
         move_dir: None,
         mods: Default::default(),
         carries_bonus: false,
+        ai_goal: None,
     });
     world.spawn_pickup_at("star", 0.5, 1.5).unwrap();
     world.step(&SimInput::default(), 1.0 / 60.0);
@@ -786,6 +796,8 @@ X....
         e.y = 1.5;
         e.dir = Dir::Up;
     }
+    // No player/base targets → AI idles and keeps facing Up at the steel.
+    world.tanks.retain(|t| t.team != Team::Player);
     for _ in 0..40 {
         world.step(&SimInput::default(), 1.0 / 60.0);
     }
@@ -813,6 +825,7 @@ X..X.
             move_dir: None,
             mods: Default::default(),
             carries_bonus: false,
+        ai_goal: None,
         });
     }
     world.spawn_pickup_at("gun", 0.5, 1.5).unwrap();
@@ -844,6 +857,7 @@ X....
         move_dir: None,
         mods: Default::default(),
     carries_bonus: false,
+        ai_goal: None,
     });
     let lives_before = world.progress.lives;
     world.spawn_pickup_at("grenade", 0.5, 1.5).unwrap();
@@ -877,6 +891,7 @@ X....
             ..Default::default()
         },
     carries_bonus: false,
+        ai_goal: None,
     });
     world.bullets.push(project1990_sim::Bullet {
         id: 501,

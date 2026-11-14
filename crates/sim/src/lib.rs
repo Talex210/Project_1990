@@ -2,6 +2,7 @@
 //!
 //! No GPU/window dependencies — unit-testable and ready for a future dedicated server.
 
+mod ai;
 mod bonus;
 mod fire;
 mod level;
@@ -13,6 +14,7 @@ mod tile;
 mod wave;
 mod world;
 
+pub use ai::{EnemyGoal, GoalTarget};
 pub use bonus::{
     bullet_speed_for_upgrade, fire_for_upgrade, upgrade_breaks_steel, upgrade_clears_forest,
     ActiveBonus, BonusCatalog, BonusDef, BonusParseError, BonusPickup, BonusState, CancelFlags,

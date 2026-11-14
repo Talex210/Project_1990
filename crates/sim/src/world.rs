@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 
+use crate::ai::{self, EnemyGoal, EnemyGoalInput, GoalTarget};
 use crate::bonus::{
     bullet_speed_for_upgrade, fire_for_upgrade, upgrade_breaks_steel, upgrade_clears_forest,
     ActiveBonus, BonusCatalog, BonusPickup, BonusState, EffectKind, TankMods,
@@ -69,6 +70,8 @@ pub struct Tank {
     pub mods: TankMods,
     /// Classic flashing carrier: killing this tank drops a letter.
     pub carries_bonus: bool,
+    /// Phase 4.1: current enemy goal (`None` for player / idle).
+    pub ai_goal: Option<EnemyGoal>,
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +248,7 @@ impl World {
                 armored: false,
             },
             carries_bonus: false,
+            ai_goal: None,
         });
     }
 
@@ -377,8 +381,8 @@ impl World {
             }
         }
 
-        // Phase 3.2: enemies seek letter pickups (full AI is phase 4).
-        self.update_enemy_bonus_seek();
+        // Phase 4.1: goal priorities (base / player / bonus / cover / bypass).
+        self.update_enemy_ai();
 
         self.move_tanks(dt);
         self.fire_weapons(dt);
@@ -476,10 +480,10 @@ impl World {
                 y: cy,
                 dir: Dir::Down,
                 fire,
-                // Seek letters in update_enemy_bonus_seek; otherwise stand & shoot.
                 move_dir: None,
                 mods: TankMods::default(),
                 carries_bonus: carries,
+                ai_goal: None,
             });
             self.wave.on_spawned();
             self.next_enemy_spawn = (idx + 1) % n;
@@ -1266,19 +1270,19 @@ impl World {
             .any(|(_, _, tile)| *tile == Tile::Water)
     }
 
-    /// Only **one** nearest enemy seeks a letter — avoids pile-ups / stuck pairs.
-    /// Uses grid BFS so seekers go around walls instead of pushing into them.
-    fn update_enemy_bonus_seek(&mut self) {
+    /// Phase 4.1: assign goals and drive movement (BFS seek still used for pathing).
+    fn update_enemy_ai(&mut self) {
         for t in &mut self.tanks {
             if t.team == Team::Enemy {
                 t.move_dir = None;
+                t.ai_goal = None;
             }
         }
         if self.bonuses.opponents_frozen(Team::Enemy) {
             return;
         }
 
-        let targets: Vec<(f32, f32)> = self
+        let bonus_targets: Vec<(f32, f32)> = self
             .bonuses
             .pickups
             .iter()
@@ -1291,58 +1295,314 @@ impl World {
                 }
             })
             .collect();
-        if targets.is_empty() {
-            return;
-        }
 
-        let mut best_pair: Option<(u64, f32, f32, f32)> = None; // eid, tx, ty, dist
-        for t in self.tanks.iter().filter(|t| t.team == Team::Enemy) {
-            for &(tx, ty) in &targets {
-                let dist = (tx - t.x).hypot(ty - t.y);
-                let better = match best_pair {
-                    None => true,
-                    Some((_, _, _, d)) => dist < d,
-                };
-                if better {
-                    best_pair = Some((t.id, tx, ty, dist));
+        let bonus_seeker: Option<(u64, f32, f32)> = {
+            let mut best: Option<(u64, f32, f32, f32)> = None;
+            for t in self.tanks.iter().filter(|t| t.team == Team::Enemy) {
+                for &(tx, ty) in &bonus_targets {
+                    let dist = (tx - t.x).hypot(ty - t.y);
+                    let better = match best {
+                        None => true,
+                        Some((_, _, _, d)) => dist < d,
+                    };
+                    if better {
+                        best = Some((t.id, tx, ty, dist));
+                    }
                 }
             }
-        }
-        let Some((eid, tx, ty, _)) = best_pair else {
-            return;
+            best.map(|(id, x, y, _)| (id, x, y))
         };
-        let Some((ex, ey, water_walk)) = self.tanks.iter().find(|t| t.id == eid).map(|t| {
-            (t.x, t.y, t.mods.water_walk)
-        }) else {
-            return;
-        };
-        let dir = self.seek_dir(eid, ex, ey, tx, ty, water_walk);
-        if let Some(tank) = self.tanks.iter_mut().find(|t| t.id == eid) {
-            tank.move_dir = dir;
-            if let Some(d) = dir {
-                tank.dir = d;
+
+        let base = self.base_center();
+        let player = self.player().map(|p| (p.x, p.y, p.dir));
+        let enemy_ids: Vec<u64> = self
+            .tanks
+            .iter()
+            .filter(|t| t.team == Team::Enemy)
+            .map(|t| t.id)
+            .collect();
+
+        for (slot, eid) in enemy_ids.into_iter().enumerate() {
+            let Some((ex, ey, water_walk)) = self
+                .tanks
+                .iter()
+                .find(|t| t.id == eid)
+                .map(|t| (t.x, t.y, t.mods.water_walk))
+            else {
+                continue;
+            };
+
+            let assigned_bonus = bonus_seeker
+                .filter(|(id, _, _)| *id == eid)
+                .map(|(_, x, y)| (x, y));
+
+            let prefer_player = (slot as u32) % 3 == 0;
+            let primary_xy = if prefer_player {
+                player
+                    .map(|(x, y, _)| (x, y))
+                    .or(base)
+            } else {
+                base.or_else(|| player.map(|(x, y, _)| (x, y)))
+            };
+
+            let primary_blocked = match primary_xy {
+                Some((tx, ty)) => !self.has_grid_path(ex, ey, tx, ty, water_walk),
+                None => false,
+            };
+
+            let under_threat = self.enemy_under_threat(eid, ex, ey, player);
+            let cover = if under_threat {
+                self.nearest_cover(ex, ey, water_walk)
+            } else {
+                None
+            };
+
+            let target = ai::pick_enemy_goal(EnemyGoalInput {
+                slot: slot as u32,
+                assigned_bonus,
+                base,
+                player: player.map(|(x, y, _)| (x, y)),
+                cover,
+                primary_blocked,
+                under_threat,
+            });
+
+            let Some(GoalTarget {
+                goal,
+                x: mut tx,
+                y: mut ty,
+            }) = target
+            else {
+                continue;
+            };
+
+            // Base tile blocks tanks — path to a neighbouring approach cell.
+            if goal == EnemyGoal::Base {
+                if let Some(a) = self.approach_cell(tx, ty, ex, ey, water_walk) {
+                    tx = a.0;
+                    ty = a.1;
+                }
+            }
+            if goal == EnemyGoal::Bypass {
+                let (cx, cy) = self.clamp_aim(tx, ty);
+                tx = cx;
+                ty = cy;
+            }
+
+            let dir = self.seek_dir(eid, ex, ey, tx, ty, water_walk);
+            if let Some(tank) = self.tanks.iter_mut().find(|t| t.id == eid) {
+                tank.ai_goal = Some(goal);
+                tank.move_dir = dir;
+                if let Some(d) = dir {
+                    tank.dir = d;
+                }
             }
         }
     }
 
-    fn dir_toward(from_x: f32, from_y: f32, to_x: f32, to_y: f32) -> Option<Dir> {
-        let dx = to_x - from_x;
-        let dy = to_y - from_y;
-        const EPS: f32 = 0.12;
-        if dx.abs() < EPS && dy.abs() < EPS {
-            return None;
-        }
-        if dx.abs() >= dy.abs() {
-            if dx > 0.0 {
-                Some(Dir::Right)
-            } else {
-                Some(Dir::Left)
+    fn clamp_aim(&self, x: f32, y: f32) -> (f32, f32) {
+        let max_x = (self.map.width() as f32 - 0.5).max(0.5);
+        let max_y = (self.map.height() as f32 - 0.5).max(0.5);
+        (x.clamp(0.5, max_x), y.clamp(0.5, max_y))
+    }
+
+    /// Walkable cell next to a blocked goal (HQ), preferring the side closer to the enemy.
+    fn approach_cell(
+        &self,
+        goal_x: f32,
+        goal_y: f32,
+        from_x: f32,
+        from_y: f32,
+        water_walk: bool,
+    ) -> Option<(f32, f32)> {
+        let gx = goal_x.floor() as i32;
+        let gy = goal_y.floor() as i32;
+        let half = self.config.tank_half;
+        let mut best: Option<(f32, f32, f32)> = None;
+        for (dx, dy) in [(0i32, -1), (0, 1), (-1, 0), (1, 0)] {
+            let nx = gx + dx;
+            let ny = gy + dy;
+            if !self.map.in_bounds(nx, ny) {
+                continue;
             }
-        } else if dy > 0.0 {
-            Some(Dir::Down)
-        } else {
-            Some(Dir::Up)
+            let cx = nx as f32 + 0.5;
+            let cy = ny as f32 + 0.5;
+            if !Self::tank_fits(&self.map, cx, cy, half, water_walk) {
+                continue;
+            }
+            let dist = (cx - from_x).hypot(cy - from_y);
+            let better = match best {
+                None => true,
+                Some((_, _, d)) => dist < d,
+            };
+            if better {
+                best = Some((cx, cy, dist));
+            }
         }
+        best.map(|(x, y, _)| (x, y))
+    }
+
+    fn base_center(&self) -> Option<(f32, f32)> {
+        for y in 0..self.map.height() {
+            for x in 0..self.map.width() {
+                if self.map.get(x, y) == Some(Tile::Base) {
+                    return Some((x as f32 + 0.5, y as f32 + 0.5));
+                }
+            }
+        }
+        None
+    }
+
+    /// Nearest brick cell the tank can stand beside (simple cover for 4.1).
+    fn nearest_cover(&self, from_x: f32, from_y: f32, water_walk: bool) -> Option<(f32, f32)> {
+        let mut best: Option<(f32, f32, f32)> = None;
+        let half = self.config.tank_half;
+        for y in 0..self.map.height() {
+            for x in 0..self.map.width() {
+                if self.map.get(x, y) != Some(Tile::Brick) {
+                    continue;
+                }
+                // Stand on an adjacent empty cell, not inside the brick.
+                for (dx, dy) in [(0i32, -1), (0, 1), (-1, 0), (1, 0)] {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if !self.map.in_bounds(nx, ny) {
+                        continue;
+                    }
+                    let cx = nx as f32 + 0.5;
+                    let cy = ny as f32 + 0.5;
+                    if !Self::tank_fits(&self.map, cx, cy, half, water_walk) {
+                        continue;
+                    }
+                    if !self.has_grid_path(from_x, from_y, cx, cy, water_walk) {
+                        continue;
+                    }
+                    let dist = (cx - from_x).hypot(cy - from_y);
+                    let better = match best {
+                        None => true,
+                        Some((_, _, d)) => dist < d,
+                    };
+                    if better {
+                        best = Some((cx, cy, dist));
+                    }
+                }
+            }
+        }
+        best.map(|(x, y, _)| (x, y))
+    }
+
+    fn enemy_under_threat(
+        &self,
+        enemy_id: u64,
+        ex: f32,
+        ey: f32,
+        player: Option<(f32, f32, Dir)>,
+    ) -> bool {
+        for b in &self.bullets {
+            if b.team != Team::Player {
+                continue;
+            }
+            if (b.x - ex).hypot(b.y - ey) < 4.0 {
+                return true;
+            }
+        }
+        let Some((px, py, pdir)) = player else {
+            return false;
+        };
+        let dist = (px - ex).hypot(py - ey);
+        if dist > 8.0 {
+            return false;
+        }
+        let _ = enemy_id;
+        ai::aims_at(pdir, px, py, ex, ey)
+    }
+
+    /// Grid BFS reachability (same walk rules as `path_waypoint`).
+    fn has_grid_path(
+        &self,
+        from_x: f32,
+        from_y: f32,
+        to_x: f32,
+        to_y: f32,
+        water_walk: bool,
+    ) -> bool {
+        let sx = from_x.floor() as i32;
+        let sy = from_y.floor() as i32;
+        let gx = to_x.floor() as i32;
+        let gy = to_y.floor() as i32;
+        if sx == gx && sy == gy {
+            return true;
+        }
+        let w = self.map.width() as i32;
+        let h = self.map.height() as i32;
+        if !(0..w).contains(&sx)
+            || !(0..h).contains(&sy)
+            || !(0..w).contains(&gx)
+            || !(0..h).contains(&gy)
+        {
+            return false;
+        }
+        let walkable = |x: i32, y: i32| -> bool {
+            if x < 0 || y < 0 || x >= w || y >= h {
+                return false;
+            }
+            match self.map.get(x as u32, y as u32) {
+                Some(Tile::Water) => water_walk,
+                Some(t) => !t.blocks_tank(),
+                None => false,
+            }
+        };
+        // Goal cell may be the base (blocked) or a tank — path to a neighbour is enough.
+        let goal_ok = |x: i32, y: i32| -> bool {
+            if x == gx && y == gy {
+                return true;
+            }
+            false
+        };
+        let mut goal_cells: Vec<(i32, i32)> = vec![(gx, gy)];
+        if !walkable(gx, gy) {
+            goal_cells.clear();
+            for (dx, dy) in [(0i32, -1), (0, 1), (-1, 0), (1, 0)] {
+                let nx = gx + dx;
+                let ny = gy + dy;
+                if walkable(nx, ny) {
+                    goal_cells.push((nx, ny));
+                }
+            }
+            if goal_cells.is_empty() {
+                return false;
+            }
+        }
+
+        let idx = |x: i32, y: i32| -> usize { (y * w + x) as usize };
+        let mut seen = vec![false; (w * h) as usize];
+        let mut q = VecDeque::new();
+        q.push_back((sx, sy));
+        seen[idx(sx, sy)] = true;
+        const STEPS: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
+        while let Some((x, y)) = q.pop_front() {
+            if goal_cells.iter().any(|&(cx, cy)| cx == x && cy == y) || goal_ok(x, y) {
+                return true;
+            }
+            for &(dx, dy) in &STEPS {
+                let nx = x + dx;
+                let ny = y + dy;
+                if !walkable(nx, ny) {
+                    continue;
+                }
+                let i = idx(nx, ny);
+                if seen[i] {
+                    continue;
+                }
+                seen[i] = true;
+                q.push_back((nx, ny));
+            }
+        }
+        false
+    }
+
+    fn dir_toward(from_x: f32, from_y: f32, to_x: f32, to_y: f32) -> Option<Dir> {
+        ai::facing_toward(from_x, from_y, to_x, to_y)
     }
 
     /// BFS waypoint + collision probe so seekers clear corners instead of wedging into walls.
@@ -2069,12 +2329,6 @@ X......
         world.step(&SimInput::default(), 1.0 / 60.0);
         assert_eq!(world.enemies_on_field(), 1);
 
-        let enemy_y = world
-            .tanks
-            .iter()
-            .find(|t| t.team == Team::Enemy)
-            .unwrap()
-            .y;
         {
             let p = world.player_mut().unwrap();
             p.x = 1.5;
@@ -2090,10 +2344,17 @@ X......
             );
         }
         let player = world.player().unwrap();
-        let gap = (player.y - enemy_y).abs();
+        let enemy = world
+            .tanks
+            .iter()
+            .find(|t| t.team == Team::Enemy)
+            .unwrap();
+        let gap_x = (player.x - enemy.x).abs();
+        let gap_y = (player.y - enemy.y).abs();
+        let min_sep = world.config.tank_half * 2.0 - 0.05;
         assert!(
-            gap >= world.config.tank_half * 2.0 - 0.05,
-            "player must not overlap enemy (gap={gap})"
+            gap_x >= min_sep || gap_y >= min_sep,
+            "player must not overlap enemy (gap_x={gap_x}, gap_y={gap_y})"
         );
     }
 
