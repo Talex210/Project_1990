@@ -74,15 +74,18 @@ Gate: `cargo test -p project1990-sim --test phase3_bonuses --test phase3_exclusi
 Отдельного AI-движка нет. **Враг и союзник** — логика в `project1990-sim` (модуль `ai`) + шаг мира; Bevy только рисует:
 
 - **Фаза 4.1 (есть):** цели `EnemyGoal` — Base / Player / Bonus / Cover / Bypass; приоритет Bonus → Cover(угроза) → Bypass(нет пути) → Base|Player по слоту (`slot % 3 == 0` → игрок).
-- общие примитивы: путь (BFS), линия угрозы, оценка укрытия;
-- дальше: анти-застревание (4.2), профили/уровень (4.3), `AllyBrain` (4.4);
+- **Фаза 4.2+ (есть):** soft-path через кирпич; **commit направления до смены клетки** (анти-спин); unstick со стабильным порядком (не каждый тик); dodge только от близкой пули на курсе; Cover больше не паркует; ~0.75 с stuck → уход, ~1.4 с → смена цели. `clear_grace_secs=6`.
+- дальше: профили/уровень (4.3), `AllyBrain` (4.4);
 - сила врага = f(номер уровня) из таблицы данных (уровни 1…100).
 
-Gate 4.1: `cargo test -p project1990-sim --test phase4_goals`.
+Gate 4.1: `cargo test -p project1990-sim --test phase4_goals`.  
+Gate 4.2: `cargo test -p project1990-sim --test phase4_pathing`.
 
 ## Сложность
 
 **Зафиксировано:** чем выше уровень, тем сильнее противник (агрессия, точность, бонусы, состав волн). Не «просто больше HP без ума».
+
+**Interim playtest:** STAGE 01–03 в `manifest.txt` — `max_on_field=2`, `spawn_interval=2.0` (было 4 / 1.5). Стальное кольцо базы не трогаем. Полная кривая — фаза 4.3.
 
 ## Тесты — gate
 

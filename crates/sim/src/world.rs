@@ -2,7 +2,10 @@
 
 use std::collections::VecDeque;
 
-use crate::ai::{self, EnemyGoal, EnemyGoalInput, GoalTarget};
+use crate::ai::{
+    self, EnemyGoal, EnemyGoalInput, GoalTarget, SeekAction, AI_COMMIT_SECS, STUCK_MOVE_EPS,
+    STUCK_SHOOT_MAX_SECS, STUCK_UNSTICK_SECS,
+};
 use crate::bonus::{
     bullet_speed_for_upgrade, fire_for_upgrade, upgrade_breaks_steel, upgrade_clears_forest,
     ActiveBonus, BonusCatalog, BonusPickup, BonusState, EffectKind, TankMods,
@@ -72,6 +75,16 @@ pub struct Tank {
     pub carries_bonus: bool,
     /// Phase 4.1: current enemy goal (`None` for player / idle).
     pub ai_goal: Option<EnemyGoal>,
+    /// Phase 4.2: seconds without meaningful movement while AI-active.
+    pub ai_stuck_secs: f32,
+    /// Position sample for stuck detection.
+    pub ai_prev_x: f32,
+    pub ai_prev_y: f32,
+    /// Hold one travel direction so the tank does not spin every tick.
+    pub ai_commit_dir: Option<Dir>,
+    pub ai_commit_left: f32,
+    /// Grid cell where the current heading was chosen; hold until we leave it (or blocked).
+    pub ai_commit_cell: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,8 +137,8 @@ impl Default for SimConfig {
                 max_bullets: 1,
             },
             bonuses: BonusCatalog::default(),
-            // Classic NES feels ~2–4s of free play after the last kill.
-            clear_grace_secs: 3.0,
+            // Free play after last kill — a bit longer so letters are grabable.
+            clear_grace_secs: 6.0,
         }
     }
 }
@@ -249,6 +262,12 @@ impl World {
             },
             carries_bonus: false,
             ai_goal: None,
+            ai_stuck_secs: 0.0,
+            ai_prev_x: x,
+            ai_prev_y: y,
+            ai_commit_dir: None,
+            ai_commit_left: 0.0,
+            ai_commit_cell: None,
         });
     }
 
@@ -381,8 +400,8 @@ impl World {
             }
         }
 
-        // Phase 4.1: goal priorities (base / player / bonus / cover / bypass).
-        self.update_enemy_ai();
+        // Phase 4.1–4.2: goals + soft path / anti-stuck.
+        self.update_enemy_ai(dt);
 
         self.move_tanks(dt);
         self.fire_weapons(dt);
@@ -484,6 +503,12 @@ impl World {
                 mods: TankMods::default(),
                 carries_bonus: carries,
                 ai_goal: None,
+                ai_stuck_secs: 0.0,
+                ai_prev_x: cx,
+                ai_prev_y: cy,
+                ai_commit_dir: None,
+                ai_commit_left: 0.0,
+                ai_commit_cell: None,
             });
             self.wave.on_spawned();
             self.next_enemy_spawn = (idx + 1) % n;
@@ -1270,13 +1295,25 @@ impl World {
             .any(|(_, _, tile)| *tile == Tile::Water)
     }
 
-    /// Phase 4.1: assign goals and drive movement (BFS seek still used for pathing).
-    fn update_enemy_ai(&mut self) {
+    /// Phase 4.1–4.2+: goals, soft brick, committed heading (anti-spin), rare bullet dodge.
+    fn update_enemy_ai(&mut self, dt: f32) {
         for t in &mut self.tanks {
-            if t.team == Team::Enemy {
-                t.move_dir = None;
-                t.ai_goal = None;
+            if t.team != Team::Enemy {
+                continue;
             }
+            let moved = (t.x - t.ai_prev_x).hypot(t.y - t.ai_prev_y);
+            if moved >= STUCK_MOVE_EPS {
+                t.ai_stuck_secs = 0.0;
+            } else {
+                t.ai_stuck_secs = (t.ai_stuck_secs + dt).min(30.0);
+            }
+            t.ai_prev_x = t.x;
+            t.ai_prev_y = t.y;
+            if t.ai_commit_left > 0.0 {
+                t.ai_commit_left = (t.ai_commit_left - dt).max(0.0);
+            }
+            t.move_dir = None;
+            t.ai_goal = None;
         }
         if self.bonuses.opponents_frozen(Team::Enemy) {
             return;
@@ -1315,89 +1352,336 @@ impl World {
 
         let base = self.base_center();
         let player = self.player().map(|p| (p.x, p.y, p.dir));
-        let enemy_ids: Vec<u64> = self
+        let half = self.config.tank_half;
+        let enemy_snap: Vec<(
+            u64,
+            f32,
+            f32,
+            bool,
+            f32,
+            u32,
+            Option<Dir>,
+            f32,
+            Option<(i32, i32)>,
+        )> = self
             .tanks
             .iter()
             .filter(|t| t.team == Team::Enemy)
-            .map(|t| t.id)
+            .enumerate()
+            .map(|(slot, t)| {
+                (
+                    t.id,
+                    t.x,
+                    t.y,
+                    t.mods.water_walk,
+                    t.ai_stuck_secs,
+                    slot as u32,
+                    t.ai_commit_dir,
+                    t.ai_commit_left,
+                    t.ai_commit_cell,
+                )
+            })
             .collect();
 
-        for (slot, eid) in enemy_ids.into_iter().enumerate() {
-            let Some((ex, ey, water_walk)) = self
-                .tanks
-                .iter()
-                .find(|t| t.id == eid)
-                .map(|t| (t.x, t.y, t.mods.water_walk))
-            else {
-                continue;
-            };
-
+        for (
+            eid,
+            ex,
+            ey,
+            water_walk,
+            stuck_secs,
+            slot,
+            commit_dir,
+            commit_left,
+            commit_cell,
+        ) in enemy_snap
+        {
             let assigned_bonus = bonus_seeker
                 .filter(|(id, _, _)| *id == eid)
                 .map(|(_, x, y)| (x, y));
 
-            let prefer_player = (slot as u32) % 3 == 0;
+            let prefer_player = slot % 3 == 0;
             let primary_xy = if prefer_player {
-                player
-                    .map(|(x, y, _)| (x, y))
-                    .or(base)
+                player.map(|(x, y, _)| (x, y)).or(base)
             } else {
                 base.or_else(|| player.map(|(x, y, _)| (x, y)))
             };
 
             let primary_blocked = match primary_xy {
-                Some((tx, ty)) => !self.has_grid_path(ex, ey, tx, ty, water_walk),
+                Some((tx, ty)) => {
+                    !self.has_grid_path(ex, ey, tx, ty, water_walk)
+                        && !self.has_soft_path(ex, ey, tx, ty, water_walk)
+                }
                 None => false,
             };
 
-            let under_threat = self.enemy_under_threat(eid, ex, ey, player);
-            let cover = if under_threat {
-                self.nearest_cover(ex, ey, water_walk)
-            } else {
-                None
-            };
-
-            let target = ai::pick_enemy_goal(EnemyGoalInput {
-                slot: slot as u32,
+            let mut target = ai::pick_enemy_goal(EnemyGoalInput {
+                slot,
                 assigned_bonus,
                 base,
                 player: player.map(|(x, y, _)| (x, y)),
-                cover,
+                cover: None,
                 primary_blocked,
-                under_threat,
+                under_threat: false,
+                stuck_secs,
             });
 
-            let Some(GoalTarget {
-                goal,
-                x: mut tx,
-                y: mut ty,
-            }) = target
-            else {
-                continue;
-            };
+            if let Some(t) = target {
+                if let Some(alt) = ai::retarget_when_stuck(
+                    stuck_secs,
+                    t.goal,
+                    slot,
+                    player.map(|(x, y, _)| (x, y)),
+                    base,
+                ) {
+                    target = Some(alt);
+                }
+            }
 
-            // Base tile blocks tanks — path to a neighbouring approach cell.
-            if goal == EnemyGoal::Base {
+            let (goal, mut tx, mut ty) = match target {
+                Some(GoalTarget { goal, x, y }) => (Some(goal), x, y),
+                None => (None, ex, ey),
+            };
+            let aim_x = tx;
+            let aim_y = ty;
+
+            if goal == Some(EnemyGoal::Base) {
                 if let Some(a) = self.approach_cell(tx, ty, ex, ey, water_walk) {
                     tx = a.0;
                     ty = a.1;
                 }
             }
-            if goal == EnemyGoal::Bypass {
+            if matches!(goal, Some(EnemyGoal::Bypass)) {
                 let (cx, cy) = self.clamp_aim(tx, ty);
                 tx = cx;
                 ty = cy;
             }
 
-            let dir = self.seek_dir(eid, ex, ey, tx, ty, water_walk);
+            let cell = (ex.floor() as i32, ey.floor() as i32);
+            let preferred = self.seek_action(eid, ex, ey, tx, ty, water_walk);
+
+            // 1) Hold heading until we leave the cell (or blocked) — anti-spin.
+            let still_in_commit_cell = commit_cell == Some(cell);
+            let commit_ok = commit_dir.and_then(|d| {
+                let time_ok = commit_left > 0.0 || still_in_commit_cell;
+                if !time_ok {
+                    return None;
+                }
+                let (dx, dy) = d.delta();
+                let nx = ex + dx * half.max(0.25);
+                let ny = ey + dy * half.max(0.25);
+                if self.can_tank_move(eid, nx, ny, half, water_walk) {
+                    Some(d)
+                } else {
+                    None
+                }
+            });
+
+            // Prefer BFS when it agrees with commit, or when commit expired.
+            // If BFS wants a *different* Move and we've left the start cell, take BFS.
+            let mut action = match (commit_ok, preferred) {
+                (Some(d), Some(SeekAction::Move(p))) if d == p => Some(SeekAction::Move(d)),
+                (Some(d), Some(SeekAction::Move(_))) if still_in_commit_cell => {
+                    Some(SeekAction::Move(d))
+                }
+                (Some(_), Some(SeekAction::Move(p))) => Some(SeekAction::Move(p)),
+                (Some(d), _) => Some(SeekAction::Move(d)),
+                (None, pref) => pref,
+            };
+
+            // 2) Dodge only a close incoming player bullet.
+            if commit_ok.is_none() {
+                if let Some(d) = self.dodge_incoming_bullet(eid, ex, ey, water_walk, slot) {
+                    action = Some(SeekAction::Move(d));
+                }
+            }
+
+            // 3) Brief brick fire when idle/blocked toward goal.
+            if action.is_none() {
+                if let Some(d) = Self::dir_toward(ex, ey, aim_x, aim_y) {
+                    if self.tile_ahead_is_brick(ex, ey, d) && stuck_secs < STUCK_SHOOT_MAX_SECS {
+                        action = Some(SeekAction::Shoot(d));
+                    }
+                }
+            }
+
+            // 4) Stable unstick when wedged.
+            if commit_ok.is_none()
+                && (stuck_secs >= STUCK_UNSTICK_SECS
+                    || action.is_none()
+                    || (matches!(action, Some(SeekAction::Shoot(_)))
+                        && stuck_secs >= STUCK_SHOOT_MAX_SECS))
+            {
+                let prefer = Self::dir_toward(ex, ey, aim_x, aim_y);
+                if let Some(d) = self.unstick_dir(eid, ex, ey, water_walk, slot, prefer) {
+                    action = Some(SeekAction::Move(d));
+                }
+            }
+
             if let Some(tank) = self.tanks.iter_mut().find(|t| t.id == eid) {
-                tank.ai_goal = Some(goal);
-                tank.move_dir = dir;
-                if let Some(d) = dir {
-                    tank.dir = d;
+                tank.ai_goal = goal;
+                match action {
+                    Some(SeekAction::Move(d)) => {
+                        tank.move_dir = Some(d);
+                        tank.dir = d;
+                        if commit_ok == Some(d) && still_in_commit_cell {
+                            // keep cell commit; refresh short time cushion
+                            tank.ai_commit_left = tank.ai_commit_left.max(0.05);
+                        } else {
+                            tank.ai_commit_dir = Some(d);
+                            tank.ai_commit_left = AI_COMMIT_SECS;
+                            tank.ai_commit_cell = Some(cell);
+                        }
+                    }
+                    Some(SeekAction::Shoot(d)) => {
+                        tank.move_dir = None;
+                        tank.dir = d;
+                        tank.ai_commit_dir = None;
+                        tank.ai_commit_left = 0.0;
+                        tank.ai_commit_cell = None;
+                    }
+                    None => {
+                        tank.ai_commit_dir = None;
+                        tank.ai_commit_left = 0.0;
+                        tank.ai_commit_cell = None;
+                        if let Some(d) = Self::dir_toward(ex, ey, aim_x, aim_y) {
+                            tank.dir = d;
+                        }
+                    }
                 }
             }
         }
+    }
+
+    fn tile_ahead_is_brick(&self, x: f32, y: f32, dir: Dir) -> bool {
+        let (dx, dy) = dir.delta();
+        let bx = (x + dx).floor() as i32;
+        let by = (y + dy).floor() as i32;
+        self.map.in_bounds(bx, by) && self.map.get(bx as u32, by as u32) == Some(Tile::Brick)
+    }
+
+    /// Side-step only when a player bullet is close and roughly aimed at us.
+    fn dodge_incoming_bullet(
+        &self,
+        tank_id: u64,
+        x: f32,
+        y: f32,
+        water_walk: bool,
+        slot: u32,
+    ) -> Option<Dir> {
+        let half = self.config.tank_half;
+        let probe = half.max(0.25);
+        let mut best: Option<(Dir, f32)> = None;
+        for b in &self.bullets {
+            if b.team != Team::Player {
+                continue;
+            }
+            let dist = (b.x - x).hypot(b.y - y);
+            if dist > 2.2 || dist < 0.15 {
+                continue;
+            }
+            // Bullet roughly heading toward our cell.
+            let (dx, dy) = b.dir.delta();
+            let to_us_x = x - b.x;
+            let to_us_y = y - b.y;
+            let toward = dx * to_us_x + dy * to_us_y;
+            if toward < 0.1 {
+                continue;
+            }
+            let cross = (dx * to_us_y - dy * to_us_x).abs();
+            if cross > 0.7 {
+                continue;
+            }
+            let dirs = ai::strafe_dirs(b.dir);
+            let order = if slot % 2 == 0 {
+                [dirs[0], dirs[1]]
+            } else {
+                [dirs[1], dirs[0]]
+            };
+            for dir in order {
+                let (sx, sy) = dir.delta();
+                let nx = x + sx * probe;
+                let ny = y + sy * probe;
+                if self.can_tank_move(tank_id, nx, ny, half, water_walk) {
+                    let score = dist;
+                    let better = match best {
+                        None => true,
+                        Some((_, d)) => score < d,
+                    };
+                    if better {
+                        best = Some((dir, score));
+                    }
+                }
+            }
+        }
+        best.map(|(d, _)| d)
+    }
+
+    /// Stable escape order (slot + cell), never rotates every tick.
+    fn unstick_dir(
+        &self,
+        tank_id: u64,
+        x: f32,
+        y: f32,
+        water_walk: bool,
+        slot: u32,
+        prefer: Option<Dir>,
+    ) -> Option<Dir> {
+        let half = self.config.tank_half;
+        let probe = half.max(0.25);
+        let facing = self
+            .tanks
+            .iter()
+            .find(|t| t.id == tank_id)
+            .map(|t| t.dir)
+            .unwrap_or(Dir::Down);
+        let cell = (x.floor() as i32).wrapping_mul(31) ^ (y.floor() as i32);
+        let bias = ((slot as i32).wrapping_add(cell).rem_euclid(4)) as u32;
+        let mut order = match bias {
+            0 => vec![Dir::Down, Dir::Left, Dir::Right, Dir::Up],
+            1 => vec![Dir::Left, Dir::Down, Dir::Up, Dir::Right],
+            2 => vec![Dir::Right, Dir::Down, Dir::Up, Dir::Left],
+            _ => vec![Dir::Up, Dir::Right, Dir::Left, Dir::Down],
+        };
+        if let Some(p) = prefer {
+            order.retain(|d| *d != p);
+            order.insert(0, p);
+        }
+        // Prefer reverse of jammed facing early.
+        let back = match facing {
+            Dir::Up => Dir::Down,
+            Dir::Down => Dir::Up,
+            Dir::Left => Dir::Right,
+            Dir::Right => Dir::Left,
+        };
+        if self.tile_ahead_is_solid(x, y, facing) {
+            order.retain(|d| *d != back);
+            order.insert(0, back);
+        }
+        for dir in order {
+            if dir == facing && self.tile_ahead_is_solid(x, y, dir) {
+                continue;
+            }
+            let (dx, dy) = dir.delta();
+            let nx = x + dx * probe;
+            let ny = y + dy * probe;
+            if self.can_tank_move(tank_id, nx, ny, half, water_walk) {
+                return Some(dir);
+            }
+        }
+        None
+    }
+
+    fn tile_ahead_is_solid(&self, x: f32, y: f32, dir: Dir) -> bool {
+        let (dx, dy) = dir.delta();
+        let bx = (x + dx).floor() as i32;
+        let by = (y + dy).floor() as i32;
+        if !self.map.in_bounds(bx, by) {
+            return true;
+        }
+        matches!(
+            self.map.get(bx as u32, by as u32),
+            Some(Tile::Steel | Tile::Brick | Tile::Water | Tile::Base)
+        )
     }
 
     fn clamp_aim(&self, x: f32, y: f32) -> (f32, f32) {
@@ -1453,7 +1737,8 @@ impl World {
         None
     }
 
-    /// Nearest brick cell the tank can stand beside (simple cover for 4.1).
+    /// Nearest brick cell the tank can stand beside (kept for future cover tuning).
+    #[allow(dead_code)]
     fn nearest_cover(&self, from_x: f32, from_y: f32, water_walk: bool) -> Option<(f32, f32)> {
         let mut best: Option<(f32, f32, f32)> = None;
         let half = self.config.tank_half;
@@ -1491,6 +1776,7 @@ impl World {
         best.map(|(x, y, _)| (x, y))
     }
 
+    #[allow(dead_code)]
     fn enemy_under_threat(
         &self,
         enemy_id: u64,
@@ -1605,8 +1891,8 @@ impl World {
         ai::facing_toward(from_x, from_y, to_x, to_y)
     }
 
-    /// BFS waypoint + collision probe so seekers clear corners instead of wedging into walls.
-    fn seek_dir(
+    /// BFS (hard walls) + soft brick: move into open cells, shoot brick waypoints.
+    fn seek_action(
         &self,
         tank_id: u64,
         from_x: f32,
@@ -1614,17 +1900,27 @@ impl World {
         to_x: f32,
         to_y: f32,
         water_walk: bool,
-    ) -> Option<Dir> {
-        let (wx, wy) = self
-            .path_waypoint(from_x, from_y, to_x, to_y, water_walk)
-            .unwrap_or((to_x, to_y));
+    ) -> Option<SeekAction> {
+        // Prefer a hard (empty-only) path; fall back to soft (through brick).
+        let hard = self.path_next(from_x, from_y, to_x, to_y, water_walk, false);
+        let soft = if hard.is_none() {
+            self.path_next(from_x, from_y, to_x, to_y, water_walk, true)
+        } else {
+            None
+        };
+        let (wx, wy, next_brick) = hard.or(soft).unwrap_or((to_x, to_y, false));
+
+        if next_brick {
+            let d = Self::dir_toward(from_x, from_y, wx, wy)?;
+            return Some(SeekAction::Shoot(d));
+        }
+
         let half = self.config.tank_half;
         let probe = half.max(0.2);
         let mut candidates: Vec<Dir> = Vec::with_capacity(4);
         if let Some(d) = Self::dir_toward(from_x, from_y, wx, wy) {
             candidates.push(d);
         }
-        // Secondary axis toward the waypoint (clears corners when primary is blocked).
         let dx = wx - from_x;
         let dy = wy - from_y;
         if dx.abs() >= 0.05 && dy.abs() >= 0.05 {
@@ -1648,32 +1944,64 @@ impl World {
                 candidates.push(dir);
             }
         }
+        let mut brick_shot = None;
         for dir in candidates {
             let (ddx, ddy) = dir.delta();
             let nx = from_x + ddx * probe;
             let ny = from_y + ddy * probe;
             if self.can_tank_move(tank_id, nx, ny, half, water_walk) {
-                return Some(dir);
+                return Some(SeekAction::Move(dir));
+            }
+            let bx = (from_x + ddx).floor() as i32;
+            let by = (from_y + ddy).floor() as i32;
+            if self.map.in_bounds(bx, by) {
+                match self.map.get(bx as u32, by as u32) {
+                    // Prefer moving around steel/water; never "shoot" steel as a plan.
+                    Some(Tile::Steel | Tile::Water | Tile::Base) => {}
+                    Some(Tile::Brick) if brick_shot.is_none() => {
+                        brick_shot = Some(SeekAction::Shoot(dir));
+                    }
+                    _ => {}
+                }
             }
         }
-        None
+        brick_shot
     }
 
-    /// Center of the next BFS cell toward the pickup (or the pickup itself if same cell).
-    fn path_waypoint(
+    /// Legacy helper: movement-only seek (tests / callers that ignore Shoot).
+    #[allow(dead_code)]
+    fn seek_dir(
+        &self,
+        tank_id: u64,
+        from_x: f32,
+        from_y: f32,
+        to_x: f32,
+        to_y: f32,
+        water_walk: bool,
+    ) -> Option<Dir> {
+        match self.seek_action(tank_id, from_x, from_y, to_x, to_y, water_walk) {
+            Some(SeekAction::Move(d)) => Some(d),
+            Some(SeekAction::Shoot(_)) | None => None,
+        }
+    }
+
+    /// Next cell center toward goal. `through_brick` treats brick as traversable (to shoot).
+    /// Returns `(wx, wy, next_cell_is_brick)`.
+    fn path_next(
         &self,
         from_x: f32,
         from_y: f32,
         to_x: f32,
         to_y: f32,
         water_walk: bool,
-    ) -> Option<(f32, f32)> {
+        through_brick: bool,
+    ) -> Option<(f32, f32, bool)> {
         let sx = from_x.floor() as i32;
         let sy = from_y.floor() as i32;
         let gx = to_x.floor() as i32;
         let gy = to_y.floor() as i32;
         if sx == gx && sy == gy {
-            return Some((to_x, to_y));
+            return Some((to_x, to_y, false));
         }
 
         let w = self.map.width() as i32;
@@ -1683,21 +2011,35 @@ impl World {
             || !(0..w).contains(&gx)
             || !(0..h).contains(&gy)
         {
-            return Some((to_x, to_y));
+            return Some((to_x, to_y, false));
         }
 
-        let walkable = |x: i32, y: i32| -> bool {
+        let passable = |x: i32, y: i32| -> bool {
             if x < 0 || y < 0 || x >= w || y >= h {
                 return false;
             }
             match self.map.get(x as u32, y as u32) {
                 Some(Tile::Water) => water_walk,
+                Some(Tile::Brick) => through_brick,
                 Some(t) => !t.blocks_tank(),
                 None => false,
             }
         };
-        if !walkable(gx, gy) {
-            return Some((to_x, to_y));
+
+        // Goal may be HQ / tank cell — path to nearest passable neighbour.
+        let mut goals: Vec<(i32, i32)> = vec![(gx, gy)];
+        if !passable(gx, gy) {
+            goals.clear();
+            for (dx, dy) in [(0i32, -1), (0, 1), (-1, 0), (1, 0)] {
+                let nx = gx + dx;
+                let ny = gy + dy;
+                if passable(nx, ny) {
+                    goals.push((nx, ny));
+                }
+            }
+            if goals.is_empty() {
+                return None;
+            }
         }
 
         let idx = |x: i32, y: i32| -> usize { (y * w + x) as usize };
@@ -1713,16 +2055,16 @@ impl World {
             (Dir::Right, 1, 0),
         ];
 
-        let mut found = false;
+        let mut found = None;
         while let Some((x, y)) = q.pop_front() {
-            if x == gx && y == gy {
-                found = true;
+            if goals.iter().any(|&(cx, cy)| cx == x && cy == y) {
+                found = Some((x, y));
                 break;
             }
             for &(dir, dx, dy) in &STEPS {
                 let nx = x + dx;
                 let ny = y + dy;
-                if !walkable(nx, ny) {
+                if !passable(nx, ny) {
                     continue;
                 }
                 let i = idx(nx, ny);
@@ -1733,13 +2075,11 @@ impl World {
                 q.push_back((nx, ny));
             }
         }
-        if !found {
-            return Some((to_x, to_y));
-        }
+        let (fx, fy) = found?;
 
-        let mut cx = gx;
-        let mut cy = gy;
-        let mut first_dir = None;
+        let mut cx = fx;
+        let mut cy = fy;
+        let mut first_step: Option<(i32, i32, Dir)> = None;
         while !(cx == sx && cy == sy) {
             let Some((px, py, dir)) = came[idx(cx, cy)] else {
                 break;
@@ -1747,21 +2087,28 @@ impl World {
             if px < 0 {
                 break;
             }
-            first_dir = Some(dir);
+            first_step = Some((cx, cy, dir));
             if px == sx && py == sy {
                 break;
             }
             cx = px;
             cy = py;
         }
-        let dir = first_dir?;
-        let (dx, dy) = match dir {
-            Dir::Up => (0, -1),
-            Dir::Down => (0, 1),
-            Dir::Left => (-1, 0),
-            Dir::Right => (1, 0),
-        };
-        Some(((sx + dx) as f32 + 0.5, (sy + dy) as f32 + 0.5))
+        let (nx, ny, _dir) = first_step?;
+        let is_brick = self.map.get(nx as u32, ny as u32) == Some(Tile::Brick);
+        Some((nx as f32 + 0.5, ny as f32 + 0.5, is_brick))
+    }
+
+    fn has_soft_path(
+        &self,
+        from_x: f32,
+        from_y: f32,
+        to_x: f32,
+        to_y: f32,
+        water_walk: bool,
+    ) -> bool {
+        self.path_next(from_x, from_y, to_x, to_y, water_walk, true)
+            .is_some()
     }
 
     /// Tank 1990 life letter for enemies: every on-field enemy gains armor / multi-hit.

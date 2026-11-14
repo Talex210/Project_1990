@@ -37,6 +37,12 @@ fn push_enemy(world: &mut World, id: u64, x: f32, y: f32) {
         mods: Default::default(),
         carries_bonus: false,
         ai_goal: None,
+            ai_stuck_secs: 0.0,
+            ai_prev_x: 0.0,
+            ai_prev_y: 0.0,
+            ai_commit_dir: None,
+            ai_commit_left: 0.0,
+            ai_commit_cell: None,
     });
 }
 
@@ -96,7 +102,7 @@ X....
 }
 
 #[test]
-fn cover_when_player_aims_down_corridor() {
+fn hunting_keeps_moving_when_player_aims() {
     let mut world = world_from(
         "\
 .....
@@ -106,7 +112,6 @@ fn cover_when_player_aims_down_corridor() {
 .P...
 ",
     );
-    // Enemy below brick; player below facing up at enemy.
     push_enemy(&mut world, 10, 1.5, 2.5);
     {
         let p = world.player_mut().unwrap();
@@ -116,10 +121,11 @@ fn cover_when_player_aims_down_corridor() {
     }
     world.step(&SimInput::default(), 1.0 / 60.0);
     let e = world.tanks.iter().find(|t| t.id == 10).unwrap();
-    assert_eq!(
-        e.ai_goal,
-        Some(EnemyGoal::Cover),
-        "threatened enemy should duck to brick cover"
+    // Cover is no longer a parking goal — keep hunting Base/Player.
+    assert!(
+        matches!(e.ai_goal, Some(EnemyGoal::Base) | Some(EnemyGoal::Player) | Some(EnemyGoal::Bypass)),
+        "got {:?}",
+        e.ai_goal
     );
 }
 

@@ -45,6 +45,12 @@ fn push_enemy(world: &mut World, id: u64, x: f32, y: f32) {
         mods: Default::default(),
         carries_bonus: false,
         ai_goal: None,
+            ai_stuck_secs: 0.0,
+            ai_prev_x: 0.0,
+            ai_prev_y: 0.0,
+            ai_commit_dir: None,
+            ai_commit_left: 0.0,
+            ai_commit_cell: None,
     });
 }
 
