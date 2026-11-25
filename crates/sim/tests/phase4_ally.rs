@@ -1,8 +1,8 @@
 //! Phase 4.4 gate: AI ally P2 — spawn, roles, score, respawn without GAME OVER.
 
 use project1990_sim::{
-    ally_face_toward, AllyRole, BonusCatalog, Dir, Map, SimConfig, SimInput, Team, WaveConfig,
-    World,
+    ally_face_toward, AllyPersist, AllyRole, BonusCatalog, Dir, Map, SimConfig, SimInput, Team,
+    WaveConfig, World,
 };
 
 fn catalog() -> BonusCatalog {
@@ -251,4 +251,193 @@ fn ally_hunts_when_field_clear_of_base_threat() {
 fn ally_face_helper_works() {
     assert_eq!(ally_face_toward(0.0, 0.0, 2.0, 0.0), Some(Dir::Right));
     assert_eq!(ally_face_toward(0.0, 0.0, 0.0, 2.0), Some(Dir::Down));
+}
+
+#[test]
+fn ally_star_does_not_upgrade_human() {
+    let mut world = ally_world(
+        "\
+.....
+.P.P.
+.....
+",
+    );
+    let (ax, ay) = {
+        let a = world.ally_tank().unwrap();
+        (a.x, a.y)
+    };
+    let human_upgrade0 = world.progress.tank_upgrade;
+    world.spawn_pickup_at("star", ax, ay).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert!(world.bonuses.pickups.is_empty(), "ally collected star");
+    assert_eq!(
+        world.progress.tank_upgrade, human_upgrade0,
+        "human progress must stay unchanged"
+    );
+    assert_eq!(world.ally.upgrade, 1);
+    assert_eq!(world.ally_tank().unwrap().mods.upgrade, 1);
+    assert_eq!(world.player().unwrap().mods.upgrade, 0);
+}
+
+#[test]
+fn ally_helmet_and_ship_stay_on_ally() {
+    let mut world = ally_world(
+        "\
+.....
+.P.P.
+.....
+",
+    );
+    let (ax, ay) = {
+        let a = world.ally_tank().unwrap();
+        (a.x, a.y)
+    };
+    world.spawn_pickup_at("helmet", ax, ay).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert!(
+        !world.progress.is_invulnerable(),
+        "helmet on ally must not arm human invuln"
+    );
+    assert!(world.ally.invuln_remaining > 0.0);
+    assert!(world.ally_tank().unwrap().mods.invuln);
+
+    let (ax, ay) = {
+        let a = world.ally_tank().unwrap();
+        (a.x, a.y)
+    };
+    world.spawn_pickup_at("ship", ax, ay).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert!(!world.progress.ship, "ship on ally must not set human ship");
+    assert!(world.ally.ship);
+    assert!(world.ally_tank().unwrap().mods.water_walk);
+}
+
+#[test]
+fn ally_persist_carries_stars_and_ship_to_next_world() {
+    let mut world = ally_world(
+        "\
+.....
+.P.P.
+.....
+",
+    );
+    let (ax, ay) = {
+        let a = world.ally_tank().unwrap();
+        (a.x, a.y)
+    };
+    world.spawn_pickup_at("star", ax, ay).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    let (ax, ay) = {
+        let a = world.ally_tank().unwrap();
+        (a.x, a.y)
+    };
+    world.spawn_pickup_at("ship", ax, ay).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    let snap = world.ally.persist();
+    assert_eq!(
+        snap,
+        AllyPersist {
+            upgrade: 1,
+            ship: true
+        }
+    );
+
+    // Simulate stage load: fresh world + carried ally persist.
+    let mut next = ally_world(
+        "\
+.....
+.P.P.
+.....
+",
+    );
+    next.apply_ally_persist(snap);
+    assert_eq!(next.ally.upgrade, 1);
+    assert!(next.ally.ship);
+    let a = next.ally_tank().unwrap();
+    assert_eq!(a.mods.upgrade, 1);
+    assert!(a.mods.water_walk);
+    assert_eq!(next.progress.tank_upgrade, 0);
+    assert!(!next.progress.ship);
+}
+
+#[test]
+fn ally_hit_strips_star_into_ally_state_not_human() {
+    let mut world = ally_world(
+        "\
+.....
+.P.P.
+.....
+",
+    );
+    let ally_id = world.ally_tank().unwrap().id;
+    let (ax, ay) = {
+        let a = world.ally_tank().unwrap();
+        (a.x, a.y)
+    };
+    world.spawn_pickup_at("star", ax, ay).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert_eq!(world.ally.upgrade, 1);
+
+    world.ally.invuln_remaining = 0.0;
+    if let Some(a) = world.tanks.iter_mut().find(|t| t.id == ally_id) {
+        a.mods.invuln = false;
+    }
+    let (ax, ay) = {
+        let a = world.ally_tank().unwrap();
+        (a.x, a.y)
+    };
+    world.bullets.push(project1990_sim::Bullet {
+        id: 902,
+        owner_id: 999,
+        team: Team::Enemy,
+        x: ax,
+        y: ay,
+        dir: Dir::Down,
+        speed: 6.0,
+    });
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert_eq!(world.ally.upgrade, 0, "absorb must write ally.upgrade");
+    assert_eq!(world.progress.tank_upgrade, 0);
+    assert!(world.ally_tank().is_some(), "★ absorb keeps ally alive");
+}
+
+#[test]
+fn ally_death_clears_ship() {
+    let mut world = ally_world(
+        "\
+.....
+.P.P.
+.....
+",
+    );
+    let ally_id = world.ally_tank().unwrap().id;
+    let (ax, ay) = {
+        let a = world.ally_tank().unwrap();
+        (a.x, a.y)
+    };
+    world.spawn_pickup_at("ship", ax, ay).unwrap();
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert!(world.ally.ship);
+
+    world.ally.invuln_remaining = 0.0;
+    if let Some(a) = world.tanks.iter_mut().find(|t| t.id == ally_id) {
+        a.mods.invuln = false;
+        a.mods.upgrade = 0;
+    }
+    let (ax, ay) = {
+        let a = world.ally_tank().unwrap();
+        (a.x, a.y)
+    };
+    world.bullets.push(project1990_sim::Bullet {
+        id: 903,
+        owner_id: 999,
+        team: Team::Enemy,
+        x: ax,
+        y: ay,
+        dir: Dir::Down,
+        speed: 6.0,
+    });
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    assert!(!world.ally.ship, "death strips ally ship like human");
+    assert!(world.ally_tank().is_some());
 }

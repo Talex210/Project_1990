@@ -161,6 +161,13 @@ impl Default for SimConfig {
     }
 }
 
+/// Stars / ship that persist for the AI ally across stages (like `PlayerProgress`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AllyPersist {
+    pub upgrade: u8,
+    pub ship: bool,
+}
+
 /// Runtime state for the AI ally (P2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AllyState {
@@ -169,6 +176,9 @@ pub struct AllyState {
     pub tank_id: Option<u64>,
     pub role: AllyRole,
     pub invuln_remaining: f32,
+    /// Persistent combat power (stage carry + mid-level pickups).
+    pub upgrade: u8,
+    pub ship: bool,
 }
 
 impl AllyState {
@@ -180,6 +190,15 @@ impl AllyState {
             tank_id: None,
             role: AllyRole::Hunt,
             invuln_remaining: 0.0,
+            upgrade: 0,
+            ship: false,
+        }
+    }
+
+    pub fn persist(&self) -> AllyPersist {
+        AllyPersist {
+            upgrade: self.upgrade,
+            ship: self.ship,
         }
     }
 
@@ -190,7 +209,7 @@ impl AllyState {
     }
 
     pub fn start_invuln(&mut self, secs: f32) {
-        self.invuln_remaining = secs.max(0.0);
+        self.invuln_remaining = self.invuln_remaining.max(secs.max(0.0));
     }
 }
 
@@ -383,10 +402,11 @@ impl World {
 
         let id = self.alloc_id();
         self.ally.tank_id = Some(id);
+        let upgrade = self.ally.upgrade.min(TankMods::MAX_UPGRADE);
         let (interval, max_b) = fire_for_upgrade(
             self.config.fire.fire_interval,
             self.config.fire.max_bullets,
-            0,
+            upgrade,
         );
         let mut fire = FireController::new(FireConfig {
             fire_interval: interval,
@@ -404,7 +424,13 @@ impl World {
             dir: Dir::Up,
             fire,
             move_dir: None,
-            mods: TankMods::default(),
+            mods: TankMods {
+                upgrade,
+                forest_clear: upgrade_clears_forest(upgrade),
+                water_walk: self.ally.ship,
+                invuln: false,
+                armored: false,
+            },
             carries_bonus: false,
             ai_goal: None,
             ai_stuck_secs: 0.0,
@@ -862,10 +888,27 @@ impl World {
 
     fn on_ally_destroyed(&mut self) {
         self.ally.tank_id = None;
-        // Solo comfort: infinite respawn with short invuln (lives not consumed).
+        // Like the human: death strips stars / ship; infinite respawn with short invuln.
+        self.ally.upgrade = 0;
+        self.ally.ship = false;
         if self.ally.enabled {
             self.spawn_ally_tank();
         }
+    }
+
+    /// Apply carried ally ★ / ship after a new stage load (call after `World::new`).
+    pub fn apply_ally_persist(&mut self, persist: AllyPersist) {
+        if !self.ally.enabled {
+            return;
+        }
+        self.ally.upgrade = persist.upgrade.min(TankMods::MAX_UPGRADE);
+        self.ally.ship = persist.ship;
+        if let Some(id) = self.ally.tank_id {
+            self.tanks.retain(|t| t.id != id);
+            self.bullets.retain(|b| b.owner_id != id);
+            self.ally.tank_id = None;
+        }
+        self.spawn_ally_tank();
     }
 
     fn move_tanks(&mut self, dt: f32) {
@@ -1261,11 +1304,23 @@ impl World {
         tank_id: u64,
         team: Team,
     ) {
+        let picker_is_ally = self
+            .tanks
+            .iter()
+            .find(|t| t.id == tank_id)
+            .map(|t| t.is_ally)
+            .unwrap_or(false);
+
         match effect {
             EffectKind::Invuln => {
                 if team == Team::Player {
-                    self.progress.invuln_remaining =
-                        self.progress.invuln_remaining.max(def.duration_secs);
+                    if picker_is_ally {
+                        // Helmet sticks to the ally tank — never the human progress bar.
+                        self.ally.start_invuln(def.duration_secs);
+                    } else {
+                        self.progress.invuln_remaining =
+                            self.progress.invuln_remaining.max(def.duration_secs);
+                    }
                     if let Some(t) = self.tanks.iter_mut().find(|t| t.id == tank_id) {
                         t.mods.invuln = true;
                     }
@@ -1364,7 +1419,9 @@ impl World {
                         next
                     };
                     t.mods.sync_forest();
-                    if team == Team::Player {
+                    if team == Team::Player && picker_is_ally {
+                        self.ally.upgrade = t.mods.upgrade;
+                    } else if team == Team::Player {
                         self.progress.tank_upgrade = t.mods.upgrade;
                     }
                     self.refresh_tank_fire(tank_id);
@@ -1389,30 +1446,37 @@ impl World {
                         self.refresh_tank_fire(eid);
                     }
                 } else if let Some(t) = self.tanks.iter_mut().find(|t| t.id == tank_id) {
-                    // Player: 1st gun → ★3; 2nd → ★4 forest.
+                    // Player/ally: 1st gun → ★3; 2nd → ★4 forest.
                     if t.mods.upgrade < TankMods::MAX_FIRE_UPGRADE {
                         t.mods.upgrade = TankMods::MAX_FIRE_UPGRADE;
                     } else {
                         t.mods.upgrade = TankMods::MAX_UPGRADE;
                     }
                     t.mods.sync_forest();
-                    self.progress.tank_upgrade = t.mods.upgrade;
+                    if picker_is_ally {
+                        self.ally.upgrade = t.mods.upgrade;
+                    } else {
+                        self.progress.tank_upgrade = t.mods.upgrade;
+                    }
                     self.refresh_tank_fire(tank_id);
                 }
             }
             EffectKind::ExtraLife => {
-                if team == Team::Player {
+                if team == Team::Player && !picker_is_ally {
                     let _ = self.progress.try_add_life();
-                } else {
+                } else if team == Team::Enemy {
                     // Tank 1990: enemy "life" → all on-field enemies gain armor (green durability).
                     self.armour_all_enemies();
                 }
+                // Ally already has infinite respawn — ExtraLife is a no-op for them.
             }
             EffectKind::WaterWalk => {
                 if let Some(t) = self.tanks.iter_mut().find(|t| t.id == tank_id) {
                     t.mods.water_walk = true;
                 }
-                if team == Team::Player {
+                if team == Team::Player && picker_is_ally {
+                    self.ally.ship = true;
+                } else if team == Team::Player {
                     self.progress.ship = true;
                 }
             }
@@ -1421,7 +1485,9 @@ impl World {
                 if let Some(t) = self.tanks.iter_mut().find(|t| t.id == tank_id) {
                     t.mods.upgrade = t.mods.upgrade.max(TankMods::FOREST_AT);
                     t.mods.sync_forest();
-                    if team == Team::Player {
+                    if team == Team::Player && picker_is_ally {
+                        self.ally.upgrade = t.mods.upgrade;
+                    } else if team == Team::Player {
                         self.progress.tank_upgrade = t.mods.upgrade;
                     }
                 }
@@ -1435,9 +1501,12 @@ impl World {
             return false;
         };
         let team = tank.team;
+        let is_ally = tank.is_ally;
         // Any solid hit strips ship (permanent until next pickup).
         tank.mods.water_walk = false;
-        if team == Team::Player {
+        if team == Team::Player && is_ally {
+            self.ally.ship = false;
+        } else if team == Team::Player {
             self.progress.ship = false;
         }
 
@@ -1447,7 +1516,9 @@ impl World {
         tank.mods.upgrade -= 1;
         tank.mods.sync_forest();
         let upgrade = tank.mods.upgrade;
-        if team == Team::Player {
+        if team == Team::Player && is_ally {
+            self.ally.upgrade = upgrade;
+        } else if team == Team::Player {
             self.progress.tank_upgrade = upgrade;
         }
         self.refresh_tank_fire(tank_id);
@@ -1478,6 +1549,7 @@ impl World {
         let player_invuln = self.progress.is_invulnerable();
         let ally_invuln = self.ally.invuln_remaining > 0.0;
         let player_ship = self.progress.ship;
+        let ally_ship = self.ally.ship;
         let half = self.config.tank_half;
         let on_water: Vec<bool> = self
             .tanks
@@ -1501,7 +1573,14 @@ impl World {
                 }
                 Team::Enemy => false,
             };
-            let ship_bonus = (tank.team == Team::Player && player_ship)
+            let ship_from_persist = if tank.is_ally {
+                ally_ship
+            } else if tank.team == Team::Player {
+                player_ship
+            } else {
+                false
+            };
+            let ship_bonus = ship_from_persist
                 || mine
                     .iter()
                     .any(|a| a.effects.contains(&EffectKind::WaterWalk));

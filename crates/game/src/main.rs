@@ -6,10 +6,10 @@ use bevy::audio::{AudioPlayer, Pitch, PlaybackSettings};
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use project1990_sim::{
-    default_save_path, AllyRole, BonusCatalog, Campaign, DifficultyTable, Dir, EnemyKind,
-    LEVEL_COUNT, LivesConfig, MAX_NAME_CHARS, MAX_PROFILES, PlayerProgress, ProfileError,
-    RoundOutcome, SaveData, ScoreConfig, SimConfig, SimInput, SimSfx, Team, Tile, World,
-    DEFAULT_TICK_HZ,
+    default_save_path, AllyPersist, AllyRole, BonusCatalog, Campaign, DifficultyTable, Dir,
+    EnemyKind, LEVEL_COUNT, LivesConfig, MAX_NAME_CHARS, MAX_PROFILES, PlayerProgress,
+    ProfileError, RoundOutcome, SaveData, ScoreConfig, SimConfig, SimInput, SimSfx, Team, Tile,
+    World, DEFAULT_TICK_HZ,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -195,7 +195,12 @@ struct HudLabel;
 #[derive(Resource)]
 struct ShowControlsHelp(bool);
 
-fn make_world(levels: &Campaign, level: u32, carry: Option<PlayerProgress>) -> World {
+fn make_world(
+    levels: &Campaign,
+    level: u32,
+    carry: Option<PlayerProgress>,
+    ally_carry: Option<AllyPersist>,
+) -> World {
     let (map, wave) = levels
         .load(level)
         .unwrap_or_else(|e| panic!("load stage {level}: {e}"));
@@ -223,6 +228,10 @@ fn make_world(levels: &Campaign, level: u32, carry: Option<PlayerProgress>) -> W
         // Stars + ship persist across stages until death / bullet hit.
         world.reapply_player_from_progress();
     }
+    if let Some(ally) = ally_carry {
+        // Ally ★ / ship are separate from the human and carry the same way.
+        world.apply_ally_persist(ally);
+    }
     world
 }
 
@@ -235,7 +244,7 @@ fn setup(
     if !save.data.has_profiles() {
         next.set(Screen::ProfileCreate);
     }
-    let world = make_world(&levels, 1, None);
+    let world = make_world(&levels, 1, None, None);
     let map_w = world.map.width() as f32;
     let map_h = world.map.height() as f32;
 
@@ -328,9 +337,10 @@ fn begin_level(
     levels: &Campaign,
     level: u32,
     carry: Option<PlayerProgress>,
+    ally_carry: Option<AllyPersist>,
 ) {
     session.number = level.clamp(1, LEVEL_COUNT);
-    *sim = SimWorld(make_world(levels, session.number, carry));
+    *sim = SimWorld(make_world(levels, session.number, carry, ally_carry));
     paused.0 = false;
 }
 
@@ -517,12 +527,12 @@ fn menu_controls(
                 .active()
                 .map(|p| p.continue_stage)
                 .unwrap_or(1);
-            begin_level(&mut sim, &mut session, &mut paused, &levels, stage, None);
+            begin_level(&mut sim, &mut session, &mut paused, &levels, stage, None, None);
             next.set(Screen::LevelIntro);
         }
         1 => {
             // New game
-            begin_level(&mut sim, &mut session, &mut paused, &levels, 1, None);
+            begin_level(&mut sim, &mut session, &mut paused, &levels, 1, None, None);
             next.set(Screen::LevelIntro);
         }
         2 => {
@@ -559,7 +569,7 @@ fn high_scores_controls(
     }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
         if scores_ctx.after_game_over {
-            begin_level(&mut sim, &mut session, &mut paused, &levels, 1, None);
+            begin_level(&mut sim, &mut session, &mut paused, &levels, 1, None, None);
             next.set(Screen::LevelIntro);
         } else {
             next.set(Screen::Menu);
@@ -632,6 +642,7 @@ fn playing_controls(
                     save.persist();
                     let next_stage = (n + 1).min(LEVEL_COUNT);
                     let carry = Some(sim.0.progress.clone());
+                    let ally_carry = Some(sim.0.ally.persist());
                     begin_level(
                         &mut sim,
                         &mut session,
@@ -639,6 +650,7 @@ fn playing_controls(
                         &levels,
                         next_stage,
                         carry,
+                        ally_carry,
                     );
                     next.set(Screen::LevelIntro);
                 }

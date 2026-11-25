@@ -40,8 +40,8 @@ pub use score::{EnemyKind, ScoreConfig, ScorePopup, StyleState};
 pub use tile::Tile;
 pub use wave::{WaveConfig, WaveState};
 pub use world::{
-    AllyState, Bullet, Dir, RoundOutcome, SimConfig, SimInput, SimSfx, Tank, Team, World,
-    DEFAULT_TICK_HZ,
+    AllyPersist, AllyState, Bullet, Dir, RoundOutcome, SimConfig, SimInput, SimSfx, Tank, Team,
+    World, DEFAULT_TICK_HZ,
 };
 
 /// Library version (workspace package version).
