@@ -63,7 +63,9 @@ pub struct EnemyGoalInput {
 }
 
 /// Fallback time-commit if tile commit is unavailable (seconds).
-pub const AI_COMMIT_SECS: f32 = 0.28;
+pub const AI_COMMIT_SECS: f32 = 0.42;
+/// Longer hold when fleeing a player aim / bullet (anti-spin near the player).
+pub const AI_FLEE_COMMIT_SECS: f32 = 0.72;
 
 /// Priority: Bonus → Bypass → Base/Player.
 /// Cover is no longer a parking goal (strafe is handled separately, rarely).
@@ -199,7 +201,7 @@ pub const STUCK_UNSTICK_SECS: f32 = 0.75;
 /// Switch objective if still not progressing.
 pub const STUCK_RETARGET_SECS: f32 = 1.4;
 /// Max time spent shooting the same brick before we must step aside.
-pub const STUCK_SHOOT_MAX_SECS: f32 = 0.85;
+pub const STUCK_SHOOT_MAX_SECS: f32 = 1.65;
 /// Movement below this (tiles) counts as no progress this tick window.
 pub const STUCK_MOVE_EPS: f32 = 0.04;
 

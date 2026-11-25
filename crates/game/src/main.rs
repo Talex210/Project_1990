@@ -1235,7 +1235,7 @@ fn ally_hud_suffix(world: &World) -> String {
         AllyRole::Hunt => "HUNT",
         AllyRole::Support => "SUPPORT",
     };
-    format!("  ALLY {} lives {}", role, world.ally.lives)
+    format!("  ALLY {role} ∞")
 }
 
 /// Readable tank silhouette: hull size/shape + barrel length/color by status.

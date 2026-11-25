@@ -148,8 +148,15 @@ fn ally_death_respawns_without_defeat() {
     world.step(&SimInput::default(), 1.0 / 60.0);
     assert_eq!(world.outcome, project1990_sim::RoundOutcome::Playing);
     assert_eq!(world.progress.lives, lives0, "player lives untouched");
-    assert_eq!(world.ally.lives, ally_lives0 - 1);
+    assert_eq!(
+        world.ally.lives, ally_lives0,
+        "ally lives are not consumed (infinite respawn)"
+    );
     assert!(world.ally_tank().is_some(), "ally respawned");
+    assert!(
+        world.ally.invuln_remaining > 0.0,
+        "short invuln after ally respawn"
+    );
 }
 
 #[test]

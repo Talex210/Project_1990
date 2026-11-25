@@ -3,8 +3,8 @@
 use std::collections::VecDeque;
 
 use crate::ai::{
-    self, EnemyGoal, EnemyGoalInput, GoalTarget, SeekAction, AI_COMMIT_SECS, STUCK_MOVE_EPS,
-    STUCK_SHOOT_MAX_SECS, STUCK_UNSTICK_SECS,
+    self, EnemyGoal, EnemyGoalInput, GoalTarget, SeekAction, AI_COMMIT_SECS, AI_FLEE_COMMIT_SECS,
+    STUCK_MOVE_EPS, STUCK_SHOOT_MAX_SECS, STUCK_UNSTICK_SECS,
 };
 use crate::ally::{
     self, AllyGoalInput, AllyRole, ALLY_GUARD_RADIUS, ALLY_SUPPORT_LEASH,
@@ -135,11 +135,11 @@ pub struct SimConfig {
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
-            // ~8s to cross a 16-tile map — closer to classic BC feel than 4.0.
-            tank_speed: 2.0,
+            // Playability pass: slower than 2.0 — more reaction time, less whiff.
+            tank_speed: 1.55,
             // Base (no stars); stars multiply via `bullet_speed_for_upgrade`.
-            // Kept ~3× tank so shots stay readable after the speed cut.
-            bullet_speed: 6.0,
+            // ~3× tank so shots stay readable after the speed cut.
+            bullet_speed: 4.8,
             tank_half: 0.4,
             bullet_half: 0.12,
             fire: FireConfig::default(),
@@ -175,7 +175,8 @@ impl AllyState {
     pub fn new(enabled: bool, starting_lives: u32) -> Self {
         Self {
             enabled,
-            lives: if enabled { starting_lives } else { 0 },
+            // Display / future human-P2 stock; solo AI ally never depletes (infinite respawn).
+            lives: if enabled { starting_lives.max(1) } else { 0 },
             tank_id: None,
             role: AllyRole::Hunt,
             invuln_remaining: 0.0,
@@ -342,7 +343,7 @@ impl World {
     }
 
     fn spawn_ally_tank(&mut self) {
-        if !self.ally.enabled || self.ally.lives == 0 {
+        if !self.ally.enabled {
             return;
         }
         // Already on field.
@@ -861,11 +862,8 @@ impl World {
 
     fn on_ally_destroyed(&mut self) {
         self.ally.tank_id = None;
-        if self.ally.lives == 0 {
-            return;
-        }
-        self.ally.lives = self.ally.lives.saturating_sub(1);
-        if self.ally.lives > 0 {
+        // Solo comfort: infinite respawn with short invuln (lives not consumed).
+        if self.ally.enabled {
             self.spawn_ally_tank();
         }
     }
@@ -1940,19 +1938,39 @@ impl World {
                 (None, pref) => pref,
             };
 
-            // 2) Threat reaction may interrupt a Move commit (side shots were free kills).
+            // 2) Threat: dodge / flee with a *long* commit so we don't twitch under the barrel.
             let mut under_threat = false;
+            let mut flee_commit = false;
             if let Some(d) = self.dodge_incoming_bullet(eid, ex, ey, water_walk, slot) {
                 action = Some(SeekAction::Move(d));
                 under_threat = true;
+                flee_commit = true;
             } else if let Some((px, py, pdir)) = player {
                 if self.player_aims_at(ex, ey, player) {
                     under_threat = true;
-                    if let Some(d) = self.strafe_dir(eid, ex, ey, water_walk, pdir, slot) {
-                        action = Some(SeekAction::Move(d));
-                    } else if let Some(face) = Self::dir_toward(ex, ey, px, py) {
-                        // Can't sidestep — turn and return fire instead of eating the shot.
-                        action = Some(SeekAction::Shoot(face));
+                    let strafe_opts = ai::strafe_dirs(pdir);
+                    // Hold an existing lateral/flee commit instead of flipping every tick.
+                    if let Some(d) = commit_ok {
+                        if strafe_opts.contains(&d)
+                            || self.dir_increases_distance(ex, ey, px, py, d)
+                        {
+                            action = Some(SeekAction::Move(d));
+                            flee_commit = true;
+                        }
+                    }
+                    if !flee_commit {
+                        if let Some(d) = self.strafe_dir(eid, ex, ey, water_walk, pdir, slot) {
+                            action = Some(SeekAction::Move(d));
+                            flee_commit = true;
+                        } else if let Some(d) =
+                            self.flee_dir(eid, ex, ey, water_walk, px, py, slot)
+                        {
+                            action = Some(SeekAction::Move(d));
+                            flee_commit = true;
+                        } else if let Some(face) = Self::dir_toward(ex, ey, px, py) {
+                            // Last resort: return fire (standing), not spin-seeking.
+                            action = Some(SeekAction::Shoot(face));
+                        }
                     }
                 }
             }
@@ -1981,11 +1999,16 @@ impl World {
                 }
             }
 
-            // 4) Brief brick fire toward goal when soft-blocked.
-            if action.is_none() {
+            // 4) Carve brick toward the goal (aggressive soft-path).
+            if !under_threat {
                 if let Some(d) = prefer {
                     if self.tile_ahead_is_brick(ex, ey, d) && stuck_secs < STUCK_SHOOT_MAX_SECS {
-                        action = Some(SeekAction::Shoot(d));
+                        let prefer_carve = action.is_none()
+                            || stuck_secs >= 0.2
+                            || matches!(preferred, Some(SeekAction::Shoot(_)));
+                        if prefer_carve {
+                            action = Some(SeekAction::Shoot(d));
+                        }
                     }
                 }
             }
@@ -2015,21 +2038,33 @@ impl World {
                     Some(SeekAction::Move(d)) => {
                         tank.move_dir = Some(d);
                         tank.dir = d;
+                        let hold = if flee_commit {
+                            AI_FLEE_COMMIT_SECS
+                        } else {
+                            AI_COMMIT_SECS
+                        };
                         if commit_ok == Some(d) && still_in_commit_cell {
-                            // keep cell commit; refresh short time cushion
-                            tank.ai_commit_left = tank.ai_commit_left.max(0.05);
+                            // keep cell commit; refresh cushion (longer while fleeing)
+                            tank.ai_commit_left = tank.ai_commit_left.max(if flee_commit {
+                                0.2
+                            } else {
+                                0.05
+                            });
                         } else {
                             tank.ai_commit_dir = Some(d);
-                            tank.ai_commit_left = AI_COMMIT_SECS;
+                            tank.ai_commit_left = hold;
                             tank.ai_commit_cell = Some(cell);
                         }
                     }
                     Some(SeekAction::Shoot(d)) => {
                         tank.move_dir = None;
                         tank.dir = d;
-                        tank.ai_commit_dir = None;
-                        tank.ai_commit_left = 0.0;
-                        tank.ai_commit_cell = None;
+                        // Keep flee heading memory only for moves; brick shots clear spin state.
+                        if !flee_commit {
+                            tank.ai_commit_dir = None;
+                            tank.ai_commit_left = 0.0;
+                            tank.ai_commit_cell = None;
+                        }
                     }
                     None => {
                         tank.ai_commit_dir = None;
@@ -2042,6 +2077,66 @@ impl World {
                 }
             }
         }
+    }
+
+    fn dir_increases_distance(
+        &self,
+        x: f32,
+        y: f32,
+        threat_x: f32,
+        threat_y: f32,
+        dir: Dir,
+    ) -> bool {
+        let (dx, dy) = dir.delta();
+        let nx = x + dx;
+        let ny = y + dy;
+        let before = (x - threat_x).hypot(y - threat_y);
+        let after = (nx - threat_x).hypot(ny - threat_y);
+        after > before + 0.05
+    }
+
+    /// Any open step that increases distance from a threat (anti-spin under the barrel).
+    fn flee_dir(
+        &self,
+        tank_id: u64,
+        x: f32,
+        y: f32,
+        water_walk: bool,
+        threat_x: f32,
+        threat_y: f32,
+        slot: u32,
+    ) -> Option<Dir> {
+        let half = self.config.tank_half;
+        let probe = half.max(0.25);
+        let mut dirs = [Dir::Up, Dir::Down, Dir::Left, Dir::Right];
+        if slot % 2 == 1 {
+            dirs.reverse();
+        }
+        let mut best: Option<(Dir, f32)> = None;
+        for dir in dirs {
+            let (dx, dy) = dir.delta();
+            let nx = x + dx * probe;
+            let ny = y + dy * probe;
+            if !self.can_tank_move(tank_id, nx, ny, half, water_walk) {
+                continue;
+            }
+            let dist = (nx - threat_x).hypot(ny - threat_y);
+            let better = match best {
+                None => true,
+                Some((_, d)) => dist > d,
+            };
+            if better {
+                best = Some((dir, dist));
+            }
+        }
+        best.and_then(|(d, dist)| {
+            let here = (x - threat_x).hypot(y - threat_y);
+            if dist > here + 0.02 {
+                Some(d)
+            } else {
+                None
+            }
+        })
     }
 
     fn tile_ahead_is_brick(&self, x: f32, y: f32, dir: Dir) -> bool {
@@ -2509,14 +2604,16 @@ impl World {
         to_y: f32,
         water_walk: bool,
     ) -> Option<SeekAction> {
-        // Prefer a hard (empty-only) path; fall back to soft (through brick).
+        // Hard (empty) + soft (through brick). Prefer carving brick when soft
+        // next cell is brick — classic BC pressure on walls toward the goal.
         let hard = self.path_next(from_x, from_y, to_x, to_y, water_walk, false);
-        let soft = if hard.is_none() {
-            self.path_next(from_x, from_y, to_x, to_y, water_walk, true)
-        } else {
-            None
+        let soft = self.path_next(from_x, from_y, to_x, to_y, water_walk, true);
+        let (wx, wy, next_brick) = match (hard, soft) {
+            (_, Some(s)) if s.2 => s,
+            (Some(h), _) => h,
+            (None, Some(s)) => s,
+            (None, None) => (to_x, to_y, false),
         };
-        let (wx, wy, next_brick) = hard.or(soft).unwrap_or((to_x, to_y, false));
 
         if next_brick {
             let d = Self::dir_toward(from_x, from_y, wx, wy)?;
