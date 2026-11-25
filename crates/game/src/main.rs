@@ -822,11 +822,8 @@ fn sync_play(
         }
     }
 
-    let invuln = sim.0.progress.is_invulnerable()
-        || sim.0.player().map(|t| t.mods.invuln).unwrap_or(false);
     // Shared blink phase. Do NOT gate it on player invuln — that froze carrier blink.
     let blink_phase = (sim.0.tick / 8) % 2 == 0;
-    let player_blink_on = !invuln || blink_phase;
 
     let live_tanks: Vec<(u64, Team, f32, f32, Dir, u8, bool, bool, bool, bool, EnemyKind, bool)> =
         sim.0
@@ -852,7 +849,7 @@ fn sync_play(
 
     let mut seen_tanks = Vec::new();
     for (entity, marker, mut tf, mut sprite, children) in &mut tanks {
-        if let Some((_, team, x, y, dir, upgrade, armored, ship, carries, _inv, kind, is_ally)) =
+        if let Some((_, team, x, y, dir, upgrade, armored, ship, carries, inv, kind, is_ally)) =
             live_tanks
                 .iter()
                 .find(|(id, _, _, _, _, _, _, _, _, _, _, _)| *id == marker.sim_id)
@@ -861,6 +858,9 @@ fn sync_play(
             tf.translation.x = bx;
             tf.translation.y = by;
             tf.rotation = Quat::from_rotation_z(dir_angle(*dir));
+            // Human + ally both blink while invulnerable after respawn / helmet.
+            let tank_invuln = *inv;
+            let blink_on = !tank_invuln || blink_phase;
             let look = TankLook::from_state(
                 *team,
                 *kind,
@@ -869,9 +869,9 @@ fn sync_play(
                 *armored,
                 *ship,
                 *carries,
-                invuln && *team == Team::Player && !*is_ally,
+                tank_invuln && *team == Team::Player,
                 blink_phase,
-                player_blink_on,
+                blink_on,
             );
             sprite.color = look.hull_color;
             sprite.custom_size = Some(look.hull);

@@ -106,6 +106,7 @@ X....
         y: ey,
         dir: Dir::Up,
         speed: 6.0,
+        owner_is_ally: true,
     });
     // Direct hit resolution.
     world.step(&SimInput::default(), 1.0 / 60.0);
@@ -144,6 +145,7 @@ fn ally_death_respawns_without_defeat() {
         y: ay,
         dir: Dir::Down,
         speed: 6.0,
+            owner_is_ally: false,
     });
     world.step(&SimInput::default(), 1.0 / 60.0);
     assert_eq!(world.outcome, project1990_sim::RoundOutcome::Playing);
@@ -156,6 +158,10 @@ fn ally_death_respawns_without_defeat() {
     assert!(
         world.ally.invuln_remaining > 0.0,
         "short invuln after ally respawn"
+    );
+    assert!(
+        world.ally_tank().unwrap().mods.invuln,
+        "respawned ally must be invulnerable immediately (blink in client)"
     );
 }
 
@@ -251,6 +257,91 @@ fn ally_hunts_when_field_clear_of_base_threat() {
 fn ally_face_helper_works() {
     assert_eq!(ally_face_toward(0.0, 0.0, 2.0, 0.0), Some(Dir::Right));
     assert_eq!(ally_face_toward(0.0, 0.0, 0.0, 2.0), Some(Dir::Down));
+}
+
+#[test]
+fn ally_bullet_cannot_destroy_naked_base() {
+    let mut world = ally_world(
+        "\
+.....
+.P.P.
+..E..
+",
+    );
+    assert_eq!(world.map.get(2, 2), Some(project1990_sim::Tile::Base));
+    let ally_id = world.ally_tank().unwrap().id;
+    // Place ally above the eagle, facing down into it.
+    {
+        let a = world.tanks.iter_mut().find(|t| t.id == ally_id).unwrap();
+        a.x = 2.5;
+        a.y = 1.5;
+        a.dir = Dir::Down;
+    }
+    world.bullets.push(project1990_sim::Bullet {
+        id: 910,
+        owner_id: ally_id,
+        team: Team::Player,
+        x: 2.5,
+        y: 1.8,
+        dir: Dir::Down,
+        speed: 8.0,
+        owner_is_ally: true,
+    });
+    for _ in 0..30 {
+        world.step(&SimInput::default(), 1.0 / 60.0);
+        if world.outcome != project1990_sim::RoundOutcome::Playing {
+            break;
+        }
+    }
+    assert_eq!(
+        world.outcome,
+        project1990_sim::RoundOutcome::Playing,
+        "ally must never end the run by razing HQ"
+    );
+    assert_eq!(world.map.get(2, 2), Some(project1990_sim::Tile::Base));
+}
+
+#[test]
+fn ally_holds_fire_when_facing_naked_base() {
+    let mut world = ally_world(
+        "\
+.....
+.....
+.P.P.
+..E..
+",
+    );
+    let ally_id = world.ally_tank().unwrap().id;
+    {
+        let a = world.tanks.iter_mut().find(|t| t.id == ally_id).unwrap();
+        a.x = 2.5;
+        a.y = 2.5;
+        a.dir = Dir::Down;
+        a.move_dir = None;
+        a.fire.autofire = true;
+        a.fire.set_fire_held(true);
+        // Ready to shoot this tick if not blocked.
+        a.fire.cooldown = 0.0;
+    }
+    world.step(&SimInput::default(), 1.0 / 60.0);
+    let a = world.ally_tank().unwrap();
+    // Whatever the AI chose: if still aimed at the naked eagle, fire must be off.
+    if a.dir == Dir::Down {
+        assert!(
+            !a.fire.fire_held && !a.fire.autofire,
+            "facing naked HQ must suppress ally fire"
+        );
+    }
+    assert!(
+        world
+            .bullets
+            .iter()
+            .filter(|b| b.owner_is_ally && b.dir == Dir::Down)
+            .count()
+            == 0,
+        "no ally bullet may be fired down into the naked HQ"
+    );
+    assert_eq!(world.map.get(2, 3), Some(project1990_sim::Tile::Base));
 }
 
 #[test]
@@ -394,6 +485,7 @@ fn ally_hit_strips_star_into_ally_state_not_human() {
         y: ay,
         dir: Dir::Down,
         speed: 6.0,
+            owner_is_ally: false,
     });
     world.step(&SimInput::default(), 1.0 / 60.0);
     assert_eq!(world.ally.upgrade, 0, "absorb must write ally.upgrade");
@@ -436,6 +528,7 @@ fn ally_death_clears_ship() {
         y: ay,
         dir: Dir::Down,
         speed: 6.0,
+            owner_is_ally: false,
     });
     world.step(&SimInput::default(), 1.0 / 60.0);
     assert!(!world.ally.ship, "death strips ally ship like human");

@@ -479,6 +479,7 @@ fn ship_is_permanent_until_hit_and_carries_in_progress() {
         y: py,
         dir: Dir::Down,
         speed: 6.0,
+            owner_is_ally: false,
     });
     next.step(&SimInput::default(), 1.0 / 60.0);
     assert!(!next.progress.ship);
@@ -518,6 +519,7 @@ fn star_absorbs_hit_instead_of_death() {
         y: py,
         dir: Dir::Up,
         speed: 6.0,
+            owner_is_ally: false,
     });
     world.step(&SimInput::default(), 1.0 / 60.0);
     assert_eq!(world.progress.lives, lives, "star hit must not cost a life");
@@ -948,6 +950,7 @@ X....
         y: py,
         dir: Dir::Down,
         speed: 6.0,
+            owner_is_ally: false,
     });
     world.step(&SimInput::default(), 1.0 / 60.0);
     assert_eq!(
@@ -1011,6 +1014,7 @@ X....
         y: 1.2,
         dir: Dir::Up,
         speed: world.config.bullet_speed,
+            owner_is_ally: false,
     });
     for _ in 0..30 {
         world.step(&SimInput::default(), 1.0 / 60.0);
@@ -1142,6 +1146,7 @@ X....
         y: 0.5,
         dir: Dir::Up,
         speed: 6.0,
+            owner_is_ally: false,
     });
     world.step(&SimInput::default(), 1.0 / 60.0);
     let enemy = world.tanks.iter().find(|t| t.id == 93).unwrap();

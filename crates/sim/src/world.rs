@@ -105,6 +105,8 @@ pub struct Bullet {
     pub dir: Dir,
     /// Tiles/sec at spawn (scales with owner star level).
     pub speed: f32,
+    /// Ally shots never destroy the HQ (even in-flight after respawn).
+    pub owner_is_ally: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,7 +154,8 @@ impl Default for SimConfig {
             },
             bonuses: BonusCatalog::default(),
             // Free play after last kill — a bit longer so letters are grabable.
-            clear_grace_secs: 6.0,
+            // Post-clear window to grab leftover letters (playtest: 6s felt tight).
+            clear_grace_secs: 9.0,
             stage: 1,
             difficulty: DifficultyTable::default(),
             // Game `make_world` turns this on; unit tests stay ally-free by default.
@@ -428,7 +431,8 @@ impl World {
                 upgrade,
                 forest_clear: upgrade_clears_forest(upgrade),
                 water_walk: self.ally.ship,
-                invuln: false,
+                // Immediate god-mode — don't wait for next sync tick.
+                invuln: true,
                 armored: false,
             },
             carries_bonus: false,
@@ -807,7 +811,9 @@ impl World {
                 if dx < half_t + half_b && dy < half_t + half_b {
                     dead_bullets.push(bi);
                     let tank_invuln = match tank.team {
-                        Team::Player if tank.is_ally => tank.mods.invuln,
+                        Team::Player if tank.is_ally => {
+                            tank.mods.invuln || self.ally.invuln_remaining > 0.0
+                        }
                         Team::Player => player_invuln || tank.mods.invuln,
                         Team::Enemy => tank.mods.invuln,
                     };
@@ -1024,13 +1030,19 @@ impl World {
             .map(|t| self.live_bullets(t.id))
             .collect();
         let enemies_frozen = self.bonuses.opponents_frozen(Team::Enemy);
+        // Ally must never open fire down a clear corridor into the HQ.
+        let ally_base_blocked: Vec<bool> = self
+            .tanks
+            .iter()
+            .map(|t| t.is_ally && self.ally_dir_hits_naked_base(t.x, t.y, t.dir))
+            .collect();
 
-        let mut shots: Vec<(u64, Team, f32, f32, Dir, f32)> = Vec::new();
-        for (tank, &live) in self.tanks.iter_mut().zip(live_counts.iter()) {
+        let mut shots: Vec<(u64, Team, f32, f32, Dir, f32, bool)> = Vec::new();
+        for (i, (tank, &live)) in self.tanks.iter_mut().zip(live_counts.iter()).enumerate() {
             // Player may shoot while frozen; only enemies lose fire when clocked.
             let fire_locked = tank.team == Team::Enemy && enemies_frozen;
             tank.fire.tick(dt);
-            if fire_locked {
+            if fire_locked || ally_base_blocked[i] {
                 continue;
             }
             if tank.fire.try_fire(live) {
@@ -1044,11 +1056,12 @@ impl World {
                     tank.y + dy * muzzle,
                     tank.dir,
                     speed,
+                    tank.is_ally,
                 ));
             }
         }
 
-        for (owner_id, team, x, y, dir, speed) in shots {
+        for (owner_id, team, x, y, dir, speed, owner_is_ally) in shots {
             let id = self.alloc_id();
             self.bullets.push(Bullet {
                 id,
@@ -1058,6 +1071,7 @@ impl World {
                 y,
                 dir,
                 speed,
+                owner_is_ally,
             });
             self.sfx.push(SimSfx::Shot);
         }
@@ -1067,7 +1081,8 @@ impl World {
     fn move_bullets(&mut self, dt: f32) -> bool {
         let half = self.config.bullet_half;
         let mut remove = Vec::new();
-        let mut tile_hits: Vec<(u32, u32, bool, bool)> = Vec::new();
+        // (tx, ty, is_base, forest_clear, from_ally)
+        let mut tile_hits: Vec<(u32, u32, bool, bool, bool)> = Vec::new();
 
         for (idx, bullet) in self.bullets.iter_mut().enumerate() {
             let (dx, dy) = bullet.dir.delta();
@@ -1085,6 +1100,7 @@ impl World {
                 continue;
             }
 
+            let from_ally = bullet.owner_is_ally;
             let owner_mods = self
                 .tanks
                 .iter()
@@ -1101,7 +1117,7 @@ impl World {
             let mut hit = false;
             for (tx, ty, tile) in overlaps {
                 if tile == Tile::Forest && clear_forest {
-                    tile_hits.push((tx, ty, false, true));
+                    tile_hits.push((tx, ty, false, true, from_ally));
                     continue;
                 }
                 if tile.blocks_bullet() {
@@ -1109,7 +1125,11 @@ impl World {
                     let can_break = tile.destroyed_by_bullet()
                         || (tile == Tile::Steel && break_steel);
                     if can_break {
-                        tile_hits.push((tx, ty, tile == Tile::Base, false));
+                        // Ally never destroys the eagle — bullet still stops on it.
+                        if tile == Tile::Base && from_ally {
+                            continue;
+                        }
+                        tile_hits.push((tx, ty, tile == Tile::Base, false, from_ally));
                     }
                 }
             }
@@ -1119,8 +1139,12 @@ impl World {
         }
 
         let mut base_destroyed = false;
-        for (tx, ty, is_base, _forest) in tile_hits {
-            if is_base || self.map.get(tx, ty) == Some(Tile::Base) {
+        for (tx, ty, is_base, _forest, from_ally) in tile_hits {
+            let hitting_base = is_base || self.map.get(tx, ty) == Some(Tile::Base);
+            if hitting_base {
+                if from_ally {
+                    continue;
+                }
                 base_destroyed = true;
             }
             let _ = self.map.set(tx, ty, Tile::Empty);
@@ -1769,20 +1793,45 @@ impl World {
             }
         }
 
-        // If close enough and facing target, prefer shoot over move.
-        if let Some(face) = ally::ally_face_toward(ax, ay, tx, ty) {
-            let dist = (tx - ax).hypot(ty - ay);
-            if dist < 6.0 && ai::aims_at(face, ax, ay, tx, ty) {
-                // Keep moving if soft-path wants Move; otherwise face and fire.
-                if !matches!(action, Some(SeekAction::Move(_))) {
-                    action = Some(SeekAction::Shoot(face));
+        let hunting = nearest_enemy.is_some() || enemy_near_base.is_some();
+
+        // If close enough and facing target, prefer shoot over move — never at a naked HQ.
+        if hunting {
+            if let Some(face) = ally::ally_face_toward(ax, ay, tx, ty) {
+                let dist = (tx - ax).hypot(ty - ay);
+                if dist < 6.0
+                    && ai::aims_at(face, ax, ay, tx, ty)
+                    && !self.ally_dir_hits_naked_base(ax, ay, face)
+                {
+                    // Keep moving if soft-path wants Move; otherwise face and fire.
+                    if !matches!(action, Some(SeekAction::Move(_))) {
+                        action = Some(SeekAction::Shoot(face));
+                    }
                 }
             }
         }
+        // Drop any Shoot that would go down a clear corridor into the eagle.
+        if let Some(SeekAction::Shoot(d)) = action {
+            if self.ally_dir_hits_naked_base(ax, ay, d) {
+                action = None;
+            }
+        }
+
+        let next_dir = match action {
+            Some(SeekAction::Move(d) | SeekAction::Shoot(d)) => d,
+            None => {
+                self.tanks
+                    .iter()
+                    .find(|t| t.id == ally_id)
+                    .map(|t| t.dir)
+                    .unwrap_or(Dir::Up)
+            }
+        };
+        let hold_fire = self.ally_dir_hits_naked_base(ax, ay, next_dir);
 
         if let Some(tank) = self.tanks.iter_mut().find(|t| t.id == ally_id) {
-            tank.fire.autofire = true;
-            tank.fire.set_fire_held(true);
+            tank.fire.autofire = !hold_fire;
+            tank.fire.set_fire_held(!hold_fire);
             match action {
                 Some(SeekAction::Move(d)) => {
                     tank.move_dir = Some(d);
@@ -1810,6 +1859,29 @@ impl World {
                 }
             }
         }
+    }
+
+    /// True when a clear (no brick/steel) bullet corridor from the ally hits the eagle.
+    fn ally_dir_hits_naked_base(&self, x: f32, y: f32, dir: Dir) -> bool {
+        let (dx, dy) = dir.delta();
+        let step = 0.25;
+        let mut cx = x + dx * self.config.tank_half;
+        let mut cy = y + dy * self.config.tank_half;
+        for _ in 0..96 {
+            cx += dx * step;
+            cy += dy * step;
+            let tx = cx.floor() as i32;
+            let ty = cy.floor() as i32;
+            if !self.map.in_bounds(tx, ty) {
+                return false;
+            }
+            match self.map.get(tx as u32, ty as u32) {
+                Some(Tile::Base) => return true,
+                Some(tile) if tile.blocks_bullet() => return false,
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Phase 4.1–4.2+: goals, soft brick, committed heading (anti-spin), rare bullet dodge.
@@ -3856,6 +3928,7 @@ X......
             y: py,
             dir: Dir::Down,
             speed: 6.0,
+            owner_is_ally: false,
         });
         world.resolve_bullet_tank_hits();
         assert_eq!(world.progress.lives, 1);
@@ -3878,6 +3951,7 @@ X......
             y: py,
             dir: Dir::Down,
             speed: 6.0,
+            owner_is_ally: false,
         });
         world.resolve_bullet_tank_hits();
         assert_eq!(world.progress.lives, 0);
@@ -3904,6 +3978,7 @@ X......
             y: world.player().unwrap().y,
             dir: Dir::Up,
             speed: 6.0,
+            owner_is_ally: false,
         });
         world.resolve_bullet_tank_hits();
         assert_eq!(world.player_tank_id(), id);
@@ -4059,6 +4134,7 @@ X......
             y: 2.0,
             dir: Dir::Up,
             speed: 6.0,
+            owner_is_ally: false,
         });
         world.bullets.push(Bullet {
             id: 2,
@@ -4068,6 +4144,7 @@ X......
             y: 2.05,
             dir: Dir::Down,
             speed: 6.0,
+            owner_is_ally: false,
         });
         world.resolve_bullet_bullet_hits();
         assert!(
@@ -4093,6 +4170,7 @@ X......
             y: 2.0,
             dir: Dir::Down,
             speed: 6.0,
+            owner_is_ally: false,
         });
         world.bullets.push(Bullet {
             id: 2,
@@ -4102,6 +4180,7 @@ X......
             y: 2.05,
             dir: Dir::Down,
             speed: 6.0,
+            owner_is_ally: false,
         });
         world.resolve_bullet_bullet_hits();
         assert_eq!(
