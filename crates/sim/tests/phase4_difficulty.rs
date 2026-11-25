@@ -170,6 +170,7 @@ X....
     armor_world.tanks.push(project1990_sim::Tank {
         id: 50,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: EnemyKind::Armor,
         move_speed: 1.0,
         x: 0.5,
@@ -198,6 +199,7 @@ X....
     fast_world.tanks.push(project1990_sim::Tank {
         id: 49,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: EnemyKind::Basic,
         move_speed: 1.0,
         x: 4.5,
@@ -218,6 +220,7 @@ X....
     fast_world.tanks.push(project1990_sim::Tank {
         id: 51,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: EnemyKind::Fast,
         move_speed: 3.0,
         x: 0.5,

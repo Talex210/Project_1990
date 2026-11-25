@@ -225,7 +225,6 @@ pub fn facing_toward(from_x: f32, from_y: f32, to_x: f32, to_y: f32) -> Option<D
 }
 
 /// True when `dir` points roughly at the target (same row/col corridor).
-#[allow(dead_code)]
 pub fn aims_at(dir: Dir, from_x: f32, from_y: f32, to_x: f32, to_y: f32) -> bool {
     let dx = to_x - from_x;
     let dy = to_y - from_y;

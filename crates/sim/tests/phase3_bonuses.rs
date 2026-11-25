@@ -233,6 +233,7 @@ fn enemy_tank_letter_armors_all_enemies() {
     world.tanks.push(project1990_sim::Tank {
         id: 70,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x: 0.5,
@@ -253,6 +254,7 @@ fn enemy_tank_letter_armors_all_enemies() {
     world.tanks.push(project1990_sim::Tank {
         id: 71,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x: 4.5,
@@ -295,6 +297,7 @@ fn shovel_fortify_ejects_tank_standing_in_ring() {
     world.tanks.push(project1990_sim::Tank {
         id: 72,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x: 1.5,
@@ -362,6 +365,7 @@ X....
         world.tanks.push(project1990_sim::Tank {
             id,
             team: Team::Enemy,
+            is_ally: false,
             enemy_kind: Default::default(),
             move_speed: 2.0,
             x: 0.5,
@@ -591,6 +595,7 @@ X....
     world.tanks.push(project1990_sim::Tank {
         id: 77,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x: 0.5,
@@ -662,6 +667,7 @@ X....
     world.tanks.push(project1990_sim::Tank {
         id: 88,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x: 0.5,
@@ -719,6 +725,7 @@ X#..
     world.tanks.push(project1990_sim::Tank {
         id: 89,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x: 0.5,
@@ -772,6 +779,7 @@ fn enemy_shovel_weakens_base_walls() {
     world.tanks.push(project1990_sim::Tank {
         id: 90,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x: 0.5,
@@ -810,6 +818,7 @@ X....
     world.tanks.push(project1990_sim::Tank {
         id: 91,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x: 0.5,
@@ -852,6 +861,7 @@ X....
     world.tanks.push(project1990_sim::Tank {
         id: 91,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x: 0.5,
@@ -896,6 +906,7 @@ X....
     world.tanks.push(project1990_sim::Tank {
         id: 92,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x: 0.5,
@@ -959,6 +970,7 @@ X....
     world.tanks.push(project1990_sim::Tank {
         id: 94,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x: 0.5,
@@ -1022,6 +1034,7 @@ X..X.
         world.tanks.push(project1990_sim::Tank {
             id,
             team: Team::Enemy,
+            is_ally: false,
             enemy_kind: Default::default(),
             move_speed: 2.0,
             x,
@@ -1061,6 +1074,7 @@ X....
     world.tanks.push(project1990_sim::Tank {
         id: 92,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x: 0.5,
@@ -1099,6 +1113,7 @@ X....
     world.tanks.push(project1990_sim::Tank {
         id: 93,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x: 0.5,

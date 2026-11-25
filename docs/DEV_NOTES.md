@@ -26,7 +26,7 @@ data/score.cfg             # таблица очков
 - Оверлей — `Text2d` + `Anchor::TOP_CENTER` в полосе `HUD_BAND_PX` над картой (playfield сдвинут вниз); окно 1024×800. Адаптивный Bevy UI / свои шрифты — фаза 6.
 - Кампания 1…100: `Campaign` в sim читает манифест; ранние карты уникальны, остальное — `placeholder.txt` + растущая волна. Уникальные раскладки — фаза 5.
 - **GAME OVER** (база или 0 жизней) → рестарт рана с STAGE 01.
-- **Отложено (2P / кооп):** игрок с 0 жизней по клавише старта может забрать 1 жизнь у второго игрока и снова выйти на поле (как в классике). Сейчас только соло — реализовать вместе с локальным P2 / ИИ-союзником.
+- **ИИ-союзник (4.4):** в соло всегда второй танк (P2). Передача жизни human↔ally по клавише старта — ещё пункт 4.5.
 
 ## Чистый код: Rust + Bevy — так лучше для нас?
 
@@ -84,12 +84,14 @@ Gate: `cargo test -p project1990-sim --test phase3_bonuses --test phase3_exclusi
 - **Фаза 4.1 (есть):** цели `EnemyGoal` — Base / Player / Bonus / Bypass (+ enum `Cover` оставлен для retarget, **не выбирается как parking-goal**). Приоритет: **Bonus → Bypass** (нет hard/soft пути к primary) → **Base|Player** по kind bias / слоту (`hunt_period` из кривой). Под угрозой цель не меняется на Cover — реакция в 4.2 (strafe/dodge/ответный огонь).
 - **Фаза 4.2+ (есть):** soft-path через кирпич; **commit до смены клетки**; unstick стабильный; dodge/strafe **прерывают commit** при угрозе (пуля / прицел игрока); если увернуться нельзя — повернуться и ответить огнём; в тупике: **1 выход → ехать**, кирпич → стрелять; **коридор** (открыты только противоположные стороны и **кирпич с обоих флангов**) → стрелять в бок; ~0.75 с stuck → уход, ~1.4 с → смена цели. `clear_grace_secs=6`.
 - **Фаза 4.3 (есть):** профили Basic/Fast/Armor/Boss + таблица силы по уровню.
+- **Фаза 4.4 (есть):** ИИ-союзник P2 (`AllyRole` Guard → Support → Hunt). `Team::Player` + `is_ally`; отдельные `AllyState.lives`; киллы в общий скор; смерть ≠ GAME OVER. В игре `ally_enabled=true` (`make_world`); в unit-тестах по умолчанию `false`. Карты: два `P` (или offset от одного). HUD: `ALLY ROLE lives N`.
 - **Часы у врага:** сброс **только** при смерти игрока/союзника (`clear_clocks_on_player_death`). Смерть носителя часы не снимает — тикает таймер.
-- дальше: `AllyBrain` (4.4), передача жизни 2P (4.5).
+- дальше: передача жизни 2P (4.5), gate смоуков (4.6).
 
 Gate 4.1: `cargo test -p project1990-sim --test phase4_goals`.  
 Gate 4.2: `cargo test -p project1990-sim --test phase4_pathing`.  
-Gate 4.3: `cargo test -p project1990-sim --test phase4_difficulty`.
+Gate 4.3: `cargo test -p project1990-sim --test phase4_difficulty`.  
+Gate 4.4: `cargo test -p project1990-sim --test phase4_ally`.
 
 ## Сложность
 

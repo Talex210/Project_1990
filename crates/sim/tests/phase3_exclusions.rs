@@ -36,6 +36,7 @@ fn push_enemy(world: &mut World, id: u64, x: f32, y: f32) {
     world.tanks.push(project1990_sim::Tank {
         id,
         team: Team::Enemy,
+        is_ally: false,
         enemy_kind: Default::default(),
         move_speed: 2.0,
         x,

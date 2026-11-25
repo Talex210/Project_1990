@@ -3,6 +3,7 @@
 //! No GPU/window dependencies — unit-testable and ready for a future dedicated server.
 
 mod ai;
+mod ally;
 mod bonus;
 mod difficulty;
 mod fire;
@@ -16,6 +17,9 @@ mod wave;
 mod world;
 
 pub use ai::{EnemyGoal, GoalTarget, SeekAction};
+pub use ally::{
+    ally_face_toward, AllyGoal, AllyGoalInput, AllyRole, ALLY_GUARD_RADIUS, ALLY_SUPPORT_LEASH,
+};
 pub use difficulty::{
     DifficultyParseError, DifficultyTable, EnemyKindProfile, GoalBias, LevelAiParams,
 };
@@ -36,7 +40,8 @@ pub use score::{EnemyKind, ScoreConfig, ScorePopup, StyleState};
 pub use tile::Tile;
 pub use wave::{WaveConfig, WaveState};
 pub use world::{
-    Bullet, Dir, RoundOutcome, SimConfig, SimInput, SimSfx, Tank, Team, World, DEFAULT_TICK_HZ,
+    AllyState, Bullet, Dir, RoundOutcome, SimConfig, SimInput, SimSfx, Tank, Team, World,
+    DEFAULT_TICK_HZ,
 };
 
 /// Library version (workspace package version).

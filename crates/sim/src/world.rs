@@ -6,6 +6,9 @@ use crate::ai::{
     self, EnemyGoal, EnemyGoalInput, GoalTarget, SeekAction, AI_COMMIT_SECS, STUCK_MOVE_EPS,
     STUCK_SHOOT_MAX_SECS, STUCK_UNSTICK_SECS,
 };
+use crate::ally::{
+    self, AllyGoalInput, AllyRole, ALLY_GUARD_RADIUS, ALLY_SUPPORT_LEASH,
+};
 use crate::bonus::{
     bullet_speed_for_upgrade, fire_for_upgrade, upgrade_breaks_steel, upgrade_clears_forest,
     ActiveBonus, BonusCatalog, BonusPickup, BonusState, EffectKind, TankMods,
@@ -61,6 +64,8 @@ fn tile_center(v: f32) -> f32 {
 pub struct Tank {
     pub id: u64,
     pub team: Team,
+    /// P2 AI ally (same team as human; not controlled by SimInput).
+    pub is_ally: bool,
     /// Scoring weight + combat profile when this tank is an enemy.
     pub enemy_kind: EnemyKind,
     /// Tiles/sec for this tank (player = config; enemies = difficulty × kind).
@@ -123,6 +128,8 @@ pub struct SimConfig {
     pub stage: u32,
     /// Enemy kind profiles + level lerp table.
     pub difficulty: DifficultyTable,
+    /// Spawn AI ally in the P2 slot (solo comfort / classic second tank).
+    pub ally_enabled: bool,
 }
 
 impl Default for SimConfig {
@@ -148,7 +155,41 @@ impl Default for SimConfig {
             clear_grace_secs: 6.0,
             stage: 1,
             difficulty: DifficultyTable::default(),
+            // Game `make_world` turns this on; unit tests stay ally-free by default.
+            ally_enabled: false,
         }
+    }
+}
+
+/// Runtime state for the AI ally (P2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AllyState {
+    pub enabled: bool,
+    pub lives: u32,
+    pub tank_id: Option<u64>,
+    pub role: AllyRole,
+    pub invuln_remaining: f32,
+}
+
+impl AllyState {
+    pub fn new(enabled: bool, starting_lives: u32) -> Self {
+        Self {
+            enabled,
+            lives: if enabled { starting_lives } else { 0 },
+            tank_id: None,
+            role: AllyRole::Hunt,
+            invuln_remaining: 0.0,
+        }
+    }
+
+    pub fn tick_invuln(&mut self, dt: f32) {
+        if self.invuln_remaining > 0.0 {
+            self.invuln_remaining = (self.invuln_remaining - dt).max(0.0);
+        }
+    }
+
+    pub fn start_invuln(&mut self, secs: f32) {
+        self.invuln_remaining = secs.max(0.0);
     }
 }
 
@@ -184,6 +225,7 @@ pub struct World {
     pub progress: PlayerProgress,
     pub style: StyleState,
     pub bonuses: BonusState,
+    pub ally: AllyState,
     pub outcome: RoundOutcome,
     pub tick: u64,
     /// Seconds left in post-clear grace (`0` = not in grace / already resolved).
@@ -201,6 +243,7 @@ impl World {
         let wave = WaveState::new(config.wave);
         let progress = PlayerProgress::new(config.lives);
         let bonuses = BonusState::new(config.bonuses.clone());
+        let ally = AllyState::new(config.ally_enabled, config.lives.starting_lives);
         let mut world = Self {
             map,
             tanks: Vec::new(),
@@ -210,6 +253,7 @@ impl World {
             progress,
             style: StyleState::default(),
             bonuses,
+            ally,
             outcome: RoundOutcome::Playing,
             tick: 0,
             clear_grace_remaining: 0.0,
@@ -219,6 +263,9 @@ impl World {
             next_enemy_spawn: 0,
         };
         world.spawn_player_tank();
+        if world.ally.enabled {
+            world.spawn_ally_tank();
+        }
         world
     }
 
@@ -235,6 +282,18 @@ impl World {
             .copied()
             .unwrap_or(crate::map::SpawnPoint { x: 1, y: 1 });
         (spawn.x as f32 + 0.5, spawn.y as f32 + 0.5)
+    }
+
+    fn ally_spawn_pos(&self) -> (f32, f32) {
+        let spawns = self.map.player_spawns();
+        if let Some(spawn) = spawns.get(1).copied() {
+            return (spawn.x as f32 + 0.5, spawn.y as f32 + 0.5);
+        }
+        // Fallback: offset from P1 when the map only has one P marker.
+        let (px, py) = self.player_spawn_pos();
+        let w = self.map.width() as f32;
+        let ox = if px + 3.0 < w - 0.5 { px + 3.0 } else { px - 3.0 };
+        (ox.clamp(0.5, (w - 0.5).max(0.5)), py)
     }
 
     fn spawn_player_tank(&mut self) {
@@ -256,6 +315,7 @@ impl World {
         self.tanks.push(Tank {
             id,
             team: Team::Player,
+            is_ally: false,
             enemy_kind: EnemyKind::Basic,
             move_speed: self.config.tank_speed,
             x,
@@ -279,6 +339,81 @@ impl World {
             ai_commit_left: 0.0,
             ai_commit_cell: None,
         });
+    }
+
+    fn spawn_ally_tank(&mut self) {
+        if !self.ally.enabled || self.ally.lives == 0 {
+            return;
+        }
+        // Already on field.
+        if self
+            .tanks
+            .iter()
+            .any(|t| t.is_ally && t.team == Team::Player)
+        {
+            return;
+        }
+        let (x, y) = self.ally_spawn_pos();
+        let half = self.config.tank_half;
+        let (x, y) = if Self::tank_fits(&self.map, x, y, half, false)
+            && !self.tank_occupies(x, y, half, None)
+        {
+            (x, y)
+        } else {
+            // Nudge around spawn if blocked.
+            let mut placed = None;
+            for dy in [-1i32, 0, 1] {
+                for dx in [-2i32, -1, 1, 2] {
+                    let nx = x + dx as f32;
+                    let ny = y + dy as f32;
+                    if Self::tank_fits(&self.map, nx, ny, half, false)
+                        && !self.tank_occupies(nx, ny, half, None)
+                    {
+                        placed = Some((nx, ny));
+                        break;
+                    }
+                }
+                if placed.is_some() {
+                    break;
+                }
+            }
+            placed.unwrap_or((x, y))
+        };
+
+        let id = self.alloc_id();
+        self.ally.tank_id = Some(id);
+        let (interval, max_b) = fire_for_upgrade(
+            self.config.fire.fire_interval,
+            self.config.fire.max_bullets,
+            0,
+        );
+        let mut fire = FireController::new(FireConfig {
+            fire_interval: interval,
+            max_bullets: max_b,
+        });
+        fire.autofire = true;
+        self.tanks.push(Tank {
+            id,
+            team: Team::Player,
+            is_ally: true,
+            enemy_kind: EnemyKind::Basic,
+            move_speed: self.config.tank_speed,
+            x,
+            y,
+            dir: Dir::Up,
+            fire,
+            move_dir: None,
+            mods: TankMods::default(),
+            carries_bonus: false,
+            ai_goal: None,
+            ai_stuck_secs: 0.0,
+            ai_prev_x: x,
+            ai_prev_y: y,
+            ai_commit_dir: None,
+            ai_commit_left: 0.0,
+            ai_commit_cell: None,
+        });
+        self.ally.start_invuln(self.config.lives.invuln_secs);
     }
 
     /// After loading carried `PlayerProgress`, rebuild the player tank so stars apply.
@@ -362,12 +497,18 @@ impl World {
     }
 
     pub fn player(&self) -> Option<&Tank> {
-        self.tanks.iter().find(|t| t.id == self.player_tank_id)
+        self.tanks
+            .iter()
+            .find(|t| t.id == self.player_tank_id && !t.is_ally)
     }
 
     pub fn player_mut(&mut self) -> Option<&mut Tank> {
         let id = self.player_tank_id;
-        self.tanks.iter_mut().find(|t| t.id == id)
+        self.tanks.iter_mut().find(|t| t.id == id && !t.is_ally)
+    }
+
+    pub fn ally_tank(&self) -> Option<&Tank> {
+        self.tanks.iter().find(|t| t.is_ally && t.team == Team::Player)
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -384,6 +525,7 @@ impl World {
 
         self.sfx.clear();
         self.progress.tick_invuln(dt);
+        self.ally.tick_invuln(dt);
         let fortify_was = self.bonuses.fortify_secs > 0.0;
         self.bonuses.tick_timers(dt);
         if fortify_was && self.bonuses.fortify_secs <= 0.0 {
@@ -412,6 +554,8 @@ impl World {
 
         // Phase 4.1–4.2: goals + soft path / anti-stuck.
         self.update_enemy_ai(dt);
+        // Phase 4.4: AI ally P2.
+        self.update_ally_ai(dt);
 
         self.move_tanks(dt);
         self.fire_weapons(dt);
@@ -527,6 +671,7 @@ impl World {
             self.tanks.push(Tank {
                 id,
                 team: Team::Enemy,
+                is_ally: false,
                 enemy_kind: kind,
                 move_speed,
                 x: cx,
@@ -635,7 +780,8 @@ impl World {
                 if dx < half_t + half_b && dy < half_t + half_b {
                     dead_bullets.push(bi);
                     let tank_invuln = match tank.team {
-                        Team::Player => player_invuln,
+                        Team::Player if tank.is_ally => tank.mods.invuln,
+                        Team::Player => player_invuln || tank.mods.invuln,
                         Team::Enemy => tank.mods.invuln,
                     };
                     if !tank_invuln {
@@ -662,10 +808,12 @@ impl World {
         }
 
         let mut player_died = false;
+        let mut ally_died = false;
         let mut drop_positions: Vec<(f32, f32)> = Vec::new();
         for tid in dead_tanks {
             if let Some(pos) = self.tanks.iter().position(|t| t.id == tid) {
                 let team = self.tanks[pos].team;
+                let is_ally = self.tanks[pos].is_ally;
                 let kind = self.tanks[pos].enemy_kind;
                 let carries = self.tanks[pos].carries_bonus;
                 let (dx, dy) = (self.tanks[pos].x, self.tanks[pos].y);
@@ -682,6 +830,9 @@ impl World {
                             drop_positions.push((dx, dy));
                         }
                     }
+                    Team::Player if is_ally => {
+                        ally_died = true;
+                    }
                     Team::Player => {
                         player_died = true;
                     }
@@ -693,6 +844,9 @@ impl World {
             self.spawn_catalog_pickup(x, y);
         }
 
+        if ally_died {
+            self.on_ally_destroyed();
+        }
         if player_died {
             self.bonuses.clear_clocks_on_player_death();
             self.style.on_player_death();
@@ -702,6 +856,17 @@ impl World {
             } else {
                 self.outcome = RoundOutcome::DefeatNoLives;
             }
+        }
+    }
+
+    fn on_ally_destroyed(&mut self) {
+        self.ally.tank_id = None;
+        if self.ally.lives == 0 {
+            return;
+        }
+        self.ally.lives = self.ally.lives.saturating_sub(1);
+        if self.ally.lives > 0 {
+            self.spawn_ally_tank();
         }
     }
 
@@ -1151,6 +1316,7 @@ impl World {
                 for vid in victims {
                     if let Some(pos) = self.tanks.iter().position(|t| t.id == vid) {
                         let vteam = self.tanks[pos].team;
+                        let is_ally = self.tanks[pos].is_ally;
                         let kind = self.tanks[pos].enemy_kind;
                         let carries = self.tanks[pos].carries_bonus;
                         let (dx, dy) = (self.tanks[pos].x, self.tanks[pos].y);
@@ -1167,6 +1333,8 @@ impl World {
                             if carries {
                                 drops.push((dx, dy));
                             }
+                        } else if vteam == Team::Player && is_ally {
+                            self.on_ally_destroyed();
                         } else if vteam == Team::Player {
                             self.bonuses.clear_clocks_on_player_death();
                             self.style.on_player_death();
@@ -1310,6 +1478,7 @@ impl World {
     fn sync_tank_mod_flags(&mut self) {
         let active = self.bonuses.active.clone();
         let player_invuln = self.progress.is_invulnerable();
+        let ally_invuln = self.ally.invuln_remaining > 0.0;
         let player_ship = self.progress.ship;
         let half = self.config.tank_half;
         let on_water: Vec<bool> = self
@@ -1325,6 +1494,9 @@ impl World {
                 .collect();
             // Enemies never get timed god-mode; H → armored + ★ instead.
             let invuln = match tank.team {
+                Team::Player if tank.is_ally => {
+                    mine.iter().any(|a| a.effects.contains(&EffectKind::Invuln)) || ally_invuln
+                }
                 Team::Player => {
                     mine.iter().any(|a| a.effects.contains(&EffectKind::Invuln))
                         || player_invuln
@@ -1347,6 +1519,220 @@ impl World {
         map.tiles_overlapping(cx, cy, half, half)
             .iter()
             .any(|(_, _, tile)| *tile == Tile::Water)
+    }
+
+    /// Phase 4.4: AI ally — Guard / Hunt / Support + reuse enemy seek helpers.
+    fn update_ally_ai(&mut self, dt: f32) {
+        if !self.ally.enabled {
+            return;
+        }
+        // Respawn if somehow missing while lives remain.
+        if self.ally.lives > 0 && self.ally_tank().is_none() {
+            self.spawn_ally_tank();
+        }
+        let Some(ally_id) = self.ally_tank().map(|t| t.id) else {
+            return;
+        };
+
+        if self.bonuses.opponents_frozen(Team::Player) {
+            if let Some(t) = self.tanks.iter_mut().find(|t| t.id == ally_id) {
+                t.move_dir = None;
+            }
+            return;
+        }
+
+        // Stuck / commit bookkeeping.
+        if let Some(t) = self.tanks.iter_mut().find(|t| t.id == ally_id) {
+            let moved = (t.x - t.ai_prev_x).hypot(t.y - t.ai_prev_y);
+            if moved >= STUCK_MOVE_EPS {
+                t.ai_stuck_secs = 0.0;
+            } else {
+                t.ai_stuck_secs = (t.ai_stuck_secs + dt).min(30.0);
+            }
+            t.ai_prev_x = t.x;
+            t.ai_prev_y = t.y;
+            if t.ai_commit_left > 0.0 {
+                t.ai_commit_left = (t.ai_commit_left - dt).max(0.0);
+            }
+            t.move_dir = None;
+        }
+
+        let (ax, ay, water_walk, stuck_secs, commit_dir, commit_left, commit_cell) = {
+            let t = self.tanks.iter().find(|t| t.id == ally_id).unwrap();
+            (
+                t.x,
+                t.y,
+                t.mods.water_walk,
+                t.ai_stuck_secs,
+                t.ai_commit_dir,
+                t.ai_commit_left,
+                t.ai_commit_cell,
+            )
+        };
+
+        let base = self.base_center();
+        let player = self.player().map(|p| (p.x, p.y, p.dir));
+        let half = self.config.tank_half;
+
+        let nearest_enemy = self
+            .tanks
+            .iter()
+            .filter(|t| t.team == Team::Enemy)
+            .map(|t| (t.x, t.y, (t.x - ax).hypot(t.y - ay)))
+            .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(x, y, _)| (x, y));
+
+        let enemy_near_base = base.and_then(|(bx, by)| {
+            self.tanks
+                .iter()
+                .filter(|t| t.team == Team::Enemy)
+                .map(|t| (t.x, t.y, (t.x - bx).hypot(t.y - by)))
+                .filter(|(_, _, d)| *d <= ALLY_GUARD_RADIUS)
+                .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(x, y, _)| (x, y))
+        });
+
+        let bonus = self
+            .bonuses
+            .pickups
+            .iter()
+            .filter_map(|p| {
+                let def = self.bonuses.catalog.get(&p.bonus_id)?;
+                if def.who.allows(Team::Player) {
+                    Some((p.x, p.y, (p.x - ax).hypot(p.y - ay)))
+                } else {
+                    None
+                }
+            })
+            .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            .filter(|(_, _, d)| *d < 8.0)
+            .map(|(x, y, _)| (x, y));
+
+        let player_threatened = match player {
+            Some((px, py, _pdir)) => {
+                // Nearby enemy, or enemy in a short aiming corridor toward the player.
+                self.tanks.iter().any(|e| {
+                    if e.team != Team::Enemy {
+                        return false;
+                    }
+                    let dist = (e.x - px).hypot(e.y - py);
+                    if dist < 4.0 {
+                        return true;
+                    }
+                    dist < 7.0 && ai::aims_at(e.dir, e.x, e.y, px, py)
+                })
+            }
+            None => false,
+        };
+
+        let goal = ally::pick_ally_goal(AllyGoalInput {
+            ally_x: ax,
+            ally_y: ay,
+            base,
+            player: player.map(|(x, y, _)| (x, y)),
+            enemy_near_base,
+            nearest_enemy,
+            player_threatened,
+            bonus,
+            guard_radius: ALLY_GUARD_RADIUS,
+            support_leash: ALLY_SUPPORT_LEASH,
+        });
+
+        let Some(goal) = goal else {
+            return;
+        };
+        self.ally.role = goal.role;
+        let (tx, ty) = (goal.x, goal.y);
+
+        let cell = (ax.floor() as i32, ay.floor() as i32);
+        let preferred = self.seek_action(ally_id, ax, ay, tx, ty, water_walk);
+
+        let still_in_commit_cell = commit_cell == Some(cell);
+        let commit_ok = commit_dir.and_then(|d| {
+            let time_ok = commit_left > 0.0 || still_in_commit_cell;
+            if !time_ok {
+                return None;
+            }
+            let (dx, dy) = d.delta();
+            let nx = ax + dx * half.max(0.25);
+            let ny = ay + dy * half.max(0.25);
+            if self.can_tank_move(ally_id, nx, ny, half, water_walk) {
+                Some(d)
+            } else {
+                None
+            }
+        });
+
+        let mut action = match (commit_ok, preferred) {
+            (Some(d), Some(SeekAction::Move(p))) if d == p => Some(SeekAction::Move(d)),
+            (Some(d), Some(SeekAction::Move(_))) if still_in_commit_cell => {
+                Some(SeekAction::Move(d))
+            }
+            (Some(_), Some(SeekAction::Move(p))) => Some(SeekAction::Move(p)),
+            (Some(d), _) => Some(SeekAction::Move(d)),
+            (None, pref) => pref,
+        };
+
+        // Threat dodge for ally (incoming enemy bullet).
+        if let Some(d) = self.dodge_incoming_bullet(ally_id, ax, ay, water_walk, 0) {
+            action = Some(SeekAction::Move(d));
+        }
+
+        let prefer = Self::dir_toward(ax, ay, tx, ty);
+        let open = self.open_move_dirs(ally_id, ax, ay, water_walk);
+        if commit_ok.is_none() && open.len() == 1 {
+            action = Some(SeekAction::Move(open[0]));
+        } else if commit_ok.is_none()
+            && (action.is_none() || stuck_secs >= STUCK_UNSTICK_SECS)
+        {
+            if let Some(d) = self.dead_end_brick_dir(ax, ay, prefer, &open) {
+                action = Some(SeekAction::Shoot(d));
+            } else if let Some(d) = self.unstick_dir(ally_id, ax, ay, water_walk, 1, prefer) {
+                action = Some(SeekAction::Move(d));
+            }
+        }
+
+        // If close enough and facing target, prefer shoot over move.
+        if let Some(face) = ally::ally_face_toward(ax, ay, tx, ty) {
+            let dist = (tx - ax).hypot(ty - ay);
+            if dist < 6.0 && ai::aims_at(face, ax, ay, tx, ty) {
+                // Keep moving if soft-path wants Move; otherwise face and fire.
+                if !matches!(action, Some(SeekAction::Move(_))) {
+                    action = Some(SeekAction::Shoot(face));
+                }
+            }
+        }
+
+        if let Some(tank) = self.tanks.iter_mut().find(|t| t.id == ally_id) {
+            tank.fire.autofire = true;
+            tank.fire.set_fire_held(true);
+            match action {
+                Some(SeekAction::Move(d)) => {
+                    tank.move_dir = Some(d);
+                    tank.dir = d;
+                    if commit_ok == Some(d) && still_in_commit_cell {
+                        tank.ai_commit_left = tank.ai_commit_left.max(0.05);
+                    } else {
+                        tank.ai_commit_dir = Some(d);
+                        tank.ai_commit_left = AI_COMMIT_SECS;
+                        tank.ai_commit_cell = Some(cell);
+                    }
+                }
+                Some(SeekAction::Shoot(d)) => {
+                    tank.move_dir = None;
+                    tank.dir = d;
+                    tank.ai_commit_dir = None;
+                    tank.ai_commit_left = 0.0;
+                    tank.ai_commit_cell = None;
+                }
+                None => {
+                    tank.move_dir = None;
+                    tank.ai_commit_dir = None;
+                    tank.ai_commit_left = 0.0;
+                    tank.ai_commit_cell = None;
+                }
+            }
+        }
     }
 
     /// Phase 4.1–4.2+: goals, soft brick, committed heading (anti-spin), rare bullet dodge.
