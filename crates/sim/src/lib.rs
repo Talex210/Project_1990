@@ -4,6 +4,7 @@
 
 mod ai;
 mod bonus;
+mod difficulty;
 mod fire;
 mod level;
 mod lives;
@@ -15,6 +16,9 @@ mod wave;
 mod world;
 
 pub use ai::{EnemyGoal, GoalTarget, SeekAction};
+pub use difficulty::{
+    DifficultyParseError, DifficultyTable, EnemyKindProfile, GoalBias, LevelAiParams,
+};
 pub use bonus::{
     bullet_speed_for_upgrade, fire_for_upgrade, upgrade_breaks_steel, upgrade_clears_forest,
     ActiveBonus, BonusCatalog, BonusDef, BonusParseError, BonusPickup, BonusState, CancelFlags,

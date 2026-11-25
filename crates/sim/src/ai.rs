@@ -3,6 +3,7 @@
 //! Goals are chosen in the headless sim so priorities stay unit-testable.
 //! Movement / shoot-through-brick still uses world path helpers.
 
+use crate::difficulty::GoalBias;
 use crate::world::Dir;
 
 /// How to act toward the current waypoint (phase 4.2).
@@ -42,6 +43,10 @@ pub struct GoalTarget {
 pub struct EnemyGoalInput {
     /// Stable slot for role mix (0 → prefer player hunt, else base).
     pub slot: u32,
+    /// From difficulty curve (`slot % hunt_period == 0` when bias is Slot).
+    pub hunt_period: u32,
+    /// Kind profile bias (Fast/Boss → player, Armor → base).
+    pub goal_bias: GoalBias,
     /// This enemy is the designated letter seeker (at most one per tick).
     pub assigned_bonus: Option<(f32, f32)>,
     pub base: Option<(f32, f32)>,
@@ -72,7 +77,12 @@ pub fn pick_enemy_goal(input: EnemyGoalInput) -> Option<GoalTarget> {
         });
     }
 
-    let prefer_player = input.slot % 3 == 0;
+    let period = input.hunt_period.max(1);
+    let prefer_player = match input.goal_bias {
+        GoalBias::PreferPlayer => true,
+        GoalBias::PreferBase => false,
+        GoalBias::Slot => input.slot % period == 0,
+    };
     let primary = if prefer_player {
         input
             .player
@@ -243,6 +253,8 @@ mod tests {
     fn base_input() -> EnemyGoalInput {
         EnemyGoalInput {
             slot: 1,
+            hunt_period: 3,
+            goal_bias: GoalBias::Slot,
             assigned_bonus: None,
             base: Some((7.5, 14.5)),
             player: Some((7.5, 12.5)),
@@ -251,6 +263,24 @@ mod tests {
             under_threat: false,
             stuck_secs: 0.0,
         }
+    }
+
+    #[test]
+    fn armor_bias_prefers_base() {
+        let mut i = base_input();
+        i.slot = 0;
+        i.goal_bias = GoalBias::PreferBase;
+        let g = pick_enemy_goal(i).unwrap();
+        assert_eq!(g.goal, EnemyGoal::Base);
+    }
+
+    #[test]
+    fn fast_bias_prefers_player() {
+        let mut i = base_input();
+        i.slot = 1;
+        i.goal_bias = GoalBias::PreferPlayer;
+        let g = pick_enemy_goal(i).unwrap();
+        assert_eq!(g.goal, EnemyGoal::Player);
     }
 
     #[test]

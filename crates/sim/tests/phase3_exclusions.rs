@@ -37,6 +37,7 @@ fn push_enemy(world: &mut World, id: u64, x: f32, y: f32) {
         id,
         team: Team::Enemy,
         enemy_kind: Default::default(),
+        move_speed: 2.0,
         x,
         y,
         dir: Dir::Down,

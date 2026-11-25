@@ -10,6 +10,7 @@ use crate::bonus::{
     bullet_speed_for_upgrade, fire_for_upgrade, upgrade_breaks_steel, upgrade_clears_forest,
     ActiveBonus, BonusCatalog, BonusPickup, BonusState, EffectKind, TankMods,
 };
+use crate::difficulty::{DifficultyTable, GoalBias};
 use crate::fire::{FireConfig, FireController};
 use crate::lives::{LivesConfig, PlayerProgress};
 use crate::map::Map;
@@ -60,8 +61,10 @@ fn tile_center(v: f32) -> f32 {
 pub struct Tank {
     pub id: u64,
     pub team: Team,
-    /// Scoring weight when this tank is an enemy.
+    /// Scoring weight + combat profile when this tank is an enemy.
     pub enemy_kind: EnemyKind,
+    /// Tiles/sec for this tank (player = config; enemies = difficulty × kind).
+    pub move_speed: f32,
     /// Center position in tile coordinates.
     pub x: f32,
     pub y: f32,
@@ -109,13 +112,17 @@ pub struct SimConfig {
     pub wave: WaveConfig,
     pub lives: LivesConfig,
     pub score: ScoreConfig,
-    /// Enemy weapon (autofire while on field).
+    /// Enemy weapon baseline (overridden per-kind/stage from `difficulty`).
     pub enemy_fire: FireConfig,
     /// Data-driven bonus catalog (empty = no drops).
     pub bonuses: BonusCatalog,
     /// Classic pause after the last enemy dies before Victory (pickups / base still live).
     /// `0` = resolve Victory on the clear tick (handy for unit tests).
     pub clear_grace_secs: f32,
+    /// Campaign stage 1…100 — drives difficulty curve.
+    pub stage: u32,
+    /// Enemy kind profiles + level lerp table.
+    pub difficulty: DifficultyTable,
 }
 
 impl Default for SimConfig {
@@ -139,6 +146,8 @@ impl Default for SimConfig {
             bonuses: BonusCatalog::default(),
             // Free play after last kill — a bit longer so letters are grabable.
             clear_grace_secs: 6.0,
+            stage: 1,
+            difficulty: DifficultyTable::default(),
         }
     }
 }
@@ -248,6 +257,7 @@ impl World {
             id,
             team: Team::Player,
             enemy_kind: EnemyKind::Basic,
+            move_speed: self.config.tank_speed,
             x,
             y,
             dir: Dir::Up,
@@ -482,7 +492,30 @@ impl World {
             }
 
             let id = self.alloc_id();
-            let mut fire = FireController::new(self.config.enemy_fire);
+            let spawn_index = self.wave.config.total_enemies.saturating_sub(
+                self.wave.remaining_to_spawn,
+            );
+            let level = self.config.difficulty.for_level(self.config.stage);
+            let kind = self.config.difficulty.pick_kind(&level, spawn_index);
+            let profile = self.config.difficulty.profile(kind);
+            let move_speed =
+                self.config
+                    .difficulty
+                    .enemy_move_speed(self.config.tank_speed, self.config.stage, kind);
+            let upgrade = profile.upgrade.min(TankMods::MAX_UPGRADE);
+            let base_iv = self
+                .config
+                .difficulty
+                .enemy_fire_interval(self.config.stage, kind);
+            let (fire_interval, max_bullets) = fire_for_upgrade(
+                base_iv,
+                self.config.enemy_fire.max_bullets,
+                upgrade,
+            );
+            let mut fire = FireController::new(FireConfig {
+                fire_interval,
+                max_bullets,
+            });
             fire.autofire = true;
             self.bonuses.spawns_since_carrier =
                 self.bonuses.spawns_since_carrier.saturating_add(1);
@@ -494,13 +527,20 @@ impl World {
             self.tanks.push(Tank {
                 id,
                 team: Team::Enemy,
-                enemy_kind: EnemyKind::Basic,
+                enemy_kind: kind,
+                move_speed,
                 x: cx,
                 y: cy,
                 dir: Dir::Down,
                 fire,
                 move_dir: None,
-                mods: TankMods::default(),
+                mods: TankMods {
+                    upgrade,
+                    forest_clear: upgrade_clears_forest(upgrade),
+                    water_walk: false,
+                    invuln: false,
+                    armored: profile.armored,
+                },
                 carries_bonus: carries,
                 ai_goal: None,
                 ai_stuck_secs: 0.0,
@@ -666,7 +706,6 @@ impl World {
     }
 
     fn move_tanks(&mut self, dt: f32) {
-        let speed = self.config.tank_speed;
         let half = self.config.tank_half;
         let n = self.tanks.len();
         let enemies_frozen = self.bonuses.opponents_frozen(Team::Enemy);
@@ -682,6 +721,11 @@ impl World {
             self.align_tank_to_grid(i, dir, dt);
             let id = self.tanks[i].id;
             let water_walk = self.tanks[i].mods.water_walk;
+            let speed = if self.tanks[i].move_speed > 0.0 {
+                self.tanks[i].move_speed
+            } else {
+                self.config.tank_speed
+            };
             let (dx, dy) = dir.delta();
             let x = self.tanks[i].x;
             let y = self.tanks[i].y;
@@ -727,7 +771,12 @@ impl World {
             return;
         }
         // Blocked hard-snap (tank overlap / corner) — light settle toward the center.
-        let settle = self.config.tank_speed * dt * 1.25;
+        let speed = if self.tanks[i].move_speed > 0.0 {
+            self.tanks[i].move_speed
+        } else {
+            self.config.tank_speed
+        };
+        let settle = speed * dt * 1.25;
         let nx = x + (tx - x).clamp(-settle, settle);
         let ny = y + (ty - y).clamp(-settle, settle);
         if self.can_tank_move(id, nx, ny, half, water_walk) {
@@ -1243,12 +1292,17 @@ impl World {
         let Some(tank) = self.tanks.iter_mut().find(|t| t.id == tank_id) else {
             return;
         };
-        let base = match tank.team {
-            Team::Player => self.config.fire,
-            Team::Enemy => self.config.enemy_fire,
+        let (base_interval, base_max) = match tank.team {
+            Team::Player => (self.config.fire.fire_interval, self.config.fire.max_bullets),
+            Team::Enemy => (
+                self.config
+                    .difficulty
+                    .enemy_fire_interval(self.config.stage, tank.enemy_kind),
+                self.config.enemy_fire.max_bullets,
+            ),
         };
         let (interval, max_b) =
-            fire_for_upgrade(base.fire_interval, base.max_bullets, tank.mods.upgrade);
+            fire_for_upgrade(base_interval, base_max, tank.mods.upgrade);
         tank.fire.config.fire_interval = interval;
         tank.fire.config.max_bullets = max_b;
     }
@@ -1353,6 +1407,8 @@ impl World {
         let base = self.base_center();
         let player = self.player().map(|p| (p.x, p.y, p.dir));
         let half = self.config.tank_half;
+        let level_ai = self.config.difficulty.for_level(self.config.stage);
+        let hunt_period = level_ai.hunt_period.max(1);
         let enemy_snap: Vec<(
             u64,
             f32,
@@ -1360,6 +1416,7 @@ impl World {
             bool,
             f32,
             u32,
+            EnemyKind,
             Option<Dir>,
             f32,
             Option<(i32, i32)>,
@@ -1376,6 +1433,7 @@ impl World {
                     t.mods.water_walk,
                     t.ai_stuck_secs,
                     slot as u32,
+                    t.enemy_kind,
                     t.ai_commit_dir,
                     t.ai_commit_left,
                     t.ai_commit_cell,
@@ -1390,6 +1448,7 @@ impl World {
             water_walk,
             stuck_secs,
             slot,
+            enemy_kind,
             commit_dir,
             commit_left,
             commit_cell,
@@ -1399,7 +1458,12 @@ impl World {
                 .filter(|(id, _, _)| *id == eid)
                 .map(|(_, x, y)| (x, y));
 
-            let prefer_player = slot % 3 == 0;
+            let goal_bias = self.config.difficulty.profile(enemy_kind).goal_bias;
+            let prefer_player = match goal_bias {
+                GoalBias::PreferPlayer => true,
+                GoalBias::PreferBase => false,
+                GoalBias::Slot => slot % hunt_period == 0,
+            };
             let primary_xy = if prefer_player {
                 player.map(|(x, y, _)| (x, y)).or(base)
             } else {
@@ -1416,6 +1480,8 @@ impl World {
 
             let mut target = ai::pick_enemy_goal(EnemyGoalInput {
                 slot,
+                hunt_period,
+                goal_bias,
                 assigned_bonus,
                 base,
                 player: player.map(|(x, y, _)| (x, y)),

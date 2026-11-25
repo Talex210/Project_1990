@@ -54,6 +54,7 @@ impl LivesConfig {
                 }
                 // Shared file with ScoreConfig — ignore point table keys.
                 "enemy_basic"
+                | "enemy_fast"
                 | "enemy_armor"
                 | "enemy_boss"
                 | "streak_bonus_per_step"

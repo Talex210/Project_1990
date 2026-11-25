@@ -6,9 +6,9 @@ use bevy::audio::{AudioPlayer, Pitch, PlaybackSettings};
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use project1990_sim::{
-    default_save_path, BonusCatalog, Campaign, Dir, LEVEL_COUNT, LivesConfig, MAX_NAME_CHARS,
-    MAX_PROFILES, PlayerProgress, ProfileError, RoundOutcome, SaveData, ScoreConfig, SimConfig,
-    SimInput, SimSfx, Team, Tile, World, DEFAULT_TICK_HZ,
+    default_save_path, BonusCatalog, Campaign, DifficultyTable, Dir, EnemyKind, LEVEL_COUNT,
+    LivesConfig, MAX_NAME_CHARS, MAX_PROFILES, PlayerProgress, ProfileError, RoundOutcome,
+    SaveData, ScoreConfig, SimConfig, SimInput, SimSfx, Team, Tile, World, DEFAULT_TICK_HZ,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,6 +18,7 @@ const TILE_PX: f32 = 32.0;
 const HUD_BAND_PX: f32 = 120.0;
 const SCORE_CFG: &str = include_str!("../../../data/score.cfg");
 const BONUS_CATALOG: &str = include_str!("../../../data/bonuses/catalog.cfg");
+const DIFFICULTY_CFG: &str = include_str!("../../../data/ai/difficulty.cfg");
 
 fn main() {
     let campaign = Campaign::bundled().expect("data/levels/manifest.txt");
@@ -200,6 +201,8 @@ fn make_world(levels: &Campaign, level: u32, carry: Option<PlayerProgress>) -> W
     let score = ScoreConfig::parse(SCORE_CFG).expect("data/score.cfg score keys");
     let lives = LivesConfig::parse(SCORE_CFG).expect("data/score.cfg lives keys");
     let bonuses = BonusCatalog::parse(BONUS_CATALOG).expect("data/bonuses/catalog.cfg");
+    let difficulty =
+        DifficultyTable::parse(DIFFICULTY_CFG).expect("data/ai/difficulty.cfg");
     let mut world = World::new(
         map,
         SimConfig {
@@ -207,6 +210,8 @@ fn make_world(levels: &Campaign, level: u32, carry: Option<PlayerProgress>) -> W
             lives,
             score,
             bonuses,
+            stage: level,
+            difficulty,
             ..Default::default()
         },
     );
@@ -809,7 +814,7 @@ fn sync_play(
     let blink_phase = (sim.0.tick / 8) % 2 == 0;
     let player_blink_on = !invuln || blink_phase;
 
-    let live_tanks: Vec<(u64, Team, f32, f32, Dir, u8, bool, bool, bool, bool)> = sim
+    let live_tanks: Vec<(u64, Team, f32, f32, Dir, u8, bool, bool, bool, bool, EnemyKind)> = sim
         .0
         .tanks
         .iter()
@@ -825,15 +830,16 @@ fn sync_play(
                 t.mods.water_walk,
                 t.carries_bonus,
                 t.mods.invuln,
+                t.enemy_kind,
             )
         })
         .collect();
 
     let mut seen_tanks = Vec::new();
     for (entity, marker, mut tf, mut sprite, children) in &mut tanks {
-        if let Some((_, team, x, y, dir, upgrade, armored, ship, carries, _inv)) = live_tanks
+        if let Some((_, team, x, y, dir, upgrade, armored, ship, carries, _inv, kind)) = live_tanks
             .iter()
-            .find(|(id, _, _, _, _, _, _, _, _, _)| *id == marker.sim_id)
+            .find(|(id, _, _, _, _, _, _, _, _, _, _)| *id == marker.sim_id)
         {
             let (bx, by) = sim_to_bevy(*x, *y, meta.map_w, meta.map_h);
             tf.translation.x = bx;
@@ -841,6 +847,7 @@ fn sync_play(
             tf.rotation = Quat::from_rotation_z(dir_angle(*dir));
             let look = TankLook::from_state(
                 *team,
+                *kind,
                 *upgrade,
                 *armored,
                 *ship,
@@ -865,7 +872,7 @@ fn sync_play(
             commands.entity(entity).despawn();
         }
     }
-    for (id, team, x, y, _, _, _, _, _, _) in &live_tanks {
+    for (id, team, x, y, _, _, _, _, _, _, _) in &live_tanks {
         if !seen_tanks.contains(id) {
             spawn_tank_sprite(
                 &mut commands,
@@ -1222,11 +1229,22 @@ struct TankLook {
 
 impl TankLook {
     fn basic(team: Team) -> Self {
-        Self::from_state(team, 0, false, false, false, false, false, true)
+        Self::from_state(
+            team,
+            EnemyKind::Basic,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        )
     }
 
     fn from_state(
         team: Team,
+        kind: EnemyKind,
         upgrade: u8,
         armored: bool,
         ship: bool,
@@ -1241,6 +1259,32 @@ impl TankLook {
         let mut hull_color = team_color(team);
         let mut barrel_color = Color::srgb(0.88, 0.88, 0.78);
 
+        // Enemy kind silhouette (classic: basic / fast / armor / heavy).
+        if team == Team::Enemy {
+            match kind {
+                EnemyKind::Basic => {}
+                EnemyKind::Fast => {
+                    // Slimmer, brighter — reads as the speedy tank.
+                    hull = Vec2::new(TILE_PX * 0.70, TILE_PX * 0.52);
+                    barrel = Vec2::new(TILE_PX * 0.14, TILE_PX * 0.38);
+                    hull_color = Color::srgb(1.0, 0.45, 0.2);
+                    barrel_color = Color::srgb(1.0, 0.75, 0.45);
+                }
+                EnemyKind::Armor => {
+                    hull = Vec2::new(TILE_PX * 0.90, TILE_PX * 0.74);
+                    barrel.x = TILE_PX * 0.22;
+                    hull_color = Color::srgb(0.2, 0.55, 0.25);
+                    barrel_color = Color::srgb(0.55, 0.8, 0.45);
+                }
+                EnemyKind::Boss => {
+                    hull = Vec2::new(TILE_PX * 0.96, TILE_PX * 0.82);
+                    barrel = Vec2::new(TILE_PX * 0.24, TILE_PX * 0.42);
+                    hull_color = Color::srgb(0.45, 0.12, 0.12);
+                    barrel_color = Color::srgb(0.95, 0.7, 0.25);
+                }
+            }
+        }
+
         if upgrade > 0 {
             // Longer gun per star; ★3–4 a bit thicker.
             let grow = upgrade as f32;
@@ -1248,7 +1292,10 @@ impl TankLook {
             barrel.x = TILE_PX * if upgrade >= 3 { 0.22 } else { 0.18 };
             match team {
                 Team::Enemy => {
-                    hull_color = Color::srgb(0.95, 0.55, 0.15);
+                    // Keep kind body; gold/orange barrel shows stars.
+                    if matches!(kind, EnemyKind::Basic | EnemyKind::Fast) {
+                        hull_color = Color::srgb(0.95, 0.55, 0.15);
+                    }
                     barrel_color = Color::srgb(1.0, 0.85, 0.35);
                 }
                 Team::Player => {
@@ -1265,12 +1312,18 @@ impl TankLook {
             hull = Vec2::new(TILE_PX * 0.92, TILE_PX * 0.78);
             barrel.x = TILE_PX * 0.24;
             if team == Team::Enemy {
-                hull_color = if blink_phase {
-                    Color::srgb(0.35, 0.95, 0.4)
+                // Boss stays dark-heavy; Armor / helmet blink green.
+                if kind == EnemyKind::Boss {
+                    hull_color = Color::srgb(0.35, 0.1, 0.1);
+                    barrel_color = Color::srgb(0.95, 0.65, 0.2);
                 } else {
-                    Color::srgb(0.15, 0.55, 0.2)
-                };
-                barrel_color = Color::srgb(0.55, 0.85, 0.45);
+                    hull_color = if blink_phase {
+                        Color::srgb(0.35, 0.95, 0.4)
+                    } else {
+                        Color::srgb(0.15, 0.55, 0.2)
+                    };
+                    barrel_color = Color::srgb(0.55, 0.85, 0.45);
+                }
             }
         }
 

@@ -2,11 +2,13 @@
 
 use std::fmt;
 
-/// Enemy weight for scoring (spawn variety grows later).
+/// Enemy weight for scoring + phase 4.3 combat profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum EnemyKind {
     #[default]
     Basic,
+    /// Classic fast tank — quicker, fragile.
+    Fast,
     Armor,
     Boss,
 }
@@ -15,6 +17,7 @@ pub enum EnemyKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScoreConfig {
     pub enemy_basic: u32,
+    pub enemy_fast: u32,
     pub enemy_armor: u32,
     pub enemy_boss: u32,
     /// Extra points per streak step after the first kill in a chain.
@@ -27,6 +30,7 @@ impl Default for ScoreConfig {
     fn default() -> Self {
         Self {
             enemy_basic: 100,
+            enemy_fast: 150,
             enemy_armor: 200,
             enemy_boss: 400,
             streak_bonus_per_step: 50,
@@ -40,6 +44,7 @@ impl ScoreConfig {
     pub fn points_for(&self, kind: EnemyKind) -> u32 {
         match kind {
             EnemyKind::Basic => self.enemy_basic,
+            EnemyKind::Fast => self.enemy_fast,
             EnemyKind::Armor => self.enemy_armor,
             EnemyKind::Boss => self.enemy_boss,
         }
@@ -71,6 +76,7 @@ impl ScoreConfig {
             })?;
             match key {
                 "enemy_basic" => cfg.enemy_basic = val,
+                "enemy_fast" => cfg.enemy_fast = val,
                 "enemy_armor" => cfg.enemy_armor = val,
                 "enemy_boss" => cfg.enemy_boss = val,
                 "streak_bonus_per_step" => cfg.streak_bonus_per_step = val,

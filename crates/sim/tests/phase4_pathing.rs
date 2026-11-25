@@ -29,6 +29,7 @@ fn push_enemy(world: &mut World, id: u64, x: f32, y: f32) {
         id,
         team: Team::Enemy,
         enemy_kind: Default::default(),
+        move_speed: 2.0,
         x,
         y,
         dir: Dir::Down,
@@ -48,7 +49,7 @@ fn push_enemy(world: &mut World, id: u64, x: f32, y: f32) {
 
 #[test]
 fn shoots_brick_blocking_path_to_base() {
-    // Only path to HQ is through brick. Player offset so Cover does not steal the goal.
+    // Only path to HQ is through brick. Player offset / facing so threat logic stays quiet.
     let mut world = world_from(
         "\
 #X#..
